@@ -1,5 +1,7 @@
 #pragma once
 
+#include "audio_writer.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -12,7 +14,9 @@ struct RecordOptions {
     double duration = 0;             // seconds; 0 = until interrupted
     uint32_t rate = 48000;
     uint8_t channels = 2;
-    bool float32 = false;
+    Format format = Format::Wav;
+    bool high_precision = false;     // WAV: 32-bit float, FLAC: 24-bit
+    int mp3_bitrate = 0;             // kbps; 0 = VBR
     bool quiet = false;
 
     bool app_mode() const { return !apps.empty() || !indices.empty(); }

@@ -1,6 +1,7 @@
 #include "wav_writer.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 
@@ -26,15 +27,22 @@ uint32_t clamp32(uint64_t v) {
 
 }  // namespace
 
+std::unique_ptr<AudioWriter> make_wav_writer(const EncoderOptions& opts) {
+    return std::make_unique<WavWriter>(opts);
+}
+
+WavWriter::WavWriter(const EncoderOptions& opts)
+    : rate_(opts.rate), channels_(opts.channels), float32_(opts.high_precision) {}
+
 WavWriter::~WavWriter() { close(); }
 
-bool WavWriter::open(const std::string& path, uint32_t rate, uint16_t channels, bool float32) {
+bool WavWriter::open(const std::string& path) {
     close();
     file_ = std::fopen(path.c_str(), "wb");
-    if (!file_) return false;
-    rate_ = rate;
-    channels_ = channels;
-    float32_ = float32;
+    if (!file_) {
+        error_ = std::strerror(errno);
+        return false;
+    }
     frames_ = 0;
     write_header();
     return std::ferror(file_) == 0;
@@ -92,9 +100,12 @@ bool WavWriter::write(const float* samples, size_t frames) {
         }
     }
 
-    const bool ok = std::fwrite(scratch_.data(), 1, scratch_.size(), file_) == scratch_.size();
     frames_ += frames;
-    return ok;
+    if (std::fwrite(scratch_.data(), 1, scratch_.size(), file_) != scratch_.size()) {
+        error_ = std::strerror(errno);
+        return false;
+    }
+    return true;
 }
 
 void WavWriter::sync() {

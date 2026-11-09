@@ -2,7 +2,7 @@
 
 #include "mixer.hpp"
 #include "pulse_common.hpp"
-#include "wav_writer.hpp"
+#include "audio_writer.hpp"
 
 #include <pulse/pulseaudio.h>
 
@@ -98,7 +98,7 @@ private:
 
     std::map<uint32_t, std::unique_ptr<Capture>> captures_;
     Mixer mixer_;
-    WavWriter wav_;
+    std::unique_ptr<AudioWriter> writer_;
 
     pa_usec_t start_usec_ = 0;  // 0 until the first audio arrives
     int64_t limit_frames_ = -1;
@@ -162,8 +162,22 @@ int Recorder::run() {
     if (opts_.duration > 0) limit_frames_ = std::llround(opts_.duration * opts_.rate);
     status_tty_ = !opts_.quiet && isatty(STDERR_FILENO);
 
-    if (!wav_.open(opts_.output, opts_.rate, opts_.channels, opts_.float32)) {
-        error("Cannot open %s for writing.", opts_.output.c_str());
+    EncoderOptions enc;
+    enc.format = opts_.format;
+    enc.rate = opts_.rate;
+    enc.channels = opts_.channels;
+    enc.high_precision = opts_.high_precision;
+    enc.mp3_bitrate = opts_.mp3_bitrate;
+    std::string why;
+    writer_ = make_writer(enc, &why);
+    if (!writer_) {
+        error("%s", why.c_str());
+        return 1;
+    }
+    if (!writer_->open(opts_.output)) {
+        error("Cannot create %s: %s", opts_.output.c_str(), writer_->error().c_str());
+        writer_.reset();
+        std::remove(opts_.output.c_str());
         return 1;
     }
 
@@ -183,7 +197,7 @@ int Recorder::run() {
     int ret = 1;
     if (pa_context_connect(ctx_, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
         error("Could not connect to the sound server: %s", pa_strerror(pa_context_errno(ctx_)));
-        wav_.close();
+        writer_->close();
         std::remove(opts_.output.c_str());
     } else {
         pa_mainloop_run(ml_, &ret);
@@ -466,9 +480,9 @@ void Recorder::on_data(Capture& c, const float* data, size_t frames, size_t queu
 void Recorder::flush_to(int64_t upto) {
     if (limit_frames_ >= 0) upto = std::min(upto, limit_frames_);
     mixer_.flush(upto, [this](const float* samples, size_t frames) {
-        if (!write_failed_ && !wav_.write(samples, frames)) {
+        if (!write_failed_ && !writer_->write(samples, frames)) {
             write_failed_ = true;
-            error("Write to %s failed (disk full?).", opts_.output.c_str());
+            error("Writing %s failed: %s", opts_.output.c_str(), writer_->error().c_str());
         }
     });
 }
@@ -511,7 +525,7 @@ void Recorder::tick() {
 
     if (now - last_sync_ >= kSyncUsec) {
         last_sync_ = now;
-        wav_.sync();
+        writer_->sync();
     }
     if (status_tty_ && now - last_status_ >= kStatusUsec) {
         last_status_ = now;
@@ -556,8 +570,8 @@ void Recorder::stop(int code) {
 
     while (!captures_.empty()) close_capture(captures_.begin()->first, false);
 
-    const uint64_t frames = wav_.frames_written();
-    wav_.close();
+    const uint64_t frames = writer_->frames_written();
+    writer_->close();
     if (frames == 0) {
         std::remove(opts_.output.c_str());
         note("No audio was captured; nothing saved.");
