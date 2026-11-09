@@ -14,6 +14,7 @@
 #include <ctime>
 #include <map>
 #include <memory>
+#include <utility>
 #include <unistd.h>
 
 namespace {
@@ -31,7 +32,42 @@ constexpr double kMixDelaySec = 3.0;
 // that and well below kMixDelaySec.
 constexpr double kResyncSec = 1.5;
 
+// Silence detection (split / auto-stop): anything below -60 dBFS counts as silent.
+constexpr float kSilenceLevel = 0.001f;
+// Silence kept at the end of a file when trailing silence is trimmed.
+constexpr double kTailSec = 0.5;
+// Upper bound on silence held back in memory while deciding whether to trim it.
+constexpr double kMaxHeldSec = 30.0;
+
 constexpr uint32_t kSystemKey = PA_INVALID_INDEX;
+
+std::string unique_path(const std::string& base, const std::string& ext) {
+    std::string path = base + ext;
+    for (int n = 2; access(path.c_str(), F_OK) == 0; ++n) path = base + " (" + std::to_string(n) + ")" + ext;
+    return path;
+}
+
+// Splits "dir/name.ext" into "dir/name" and ".ext" (ext may be empty).
+std::pair<std::string, std::string> split_extension(const std::string& path) {
+    const auto slash = path.find_last_of('/');
+    const auto dot = path.find_last_of('.');
+    if (dot == std::string::npos || dot == 0 || (slash != std::string::npos && dot <= slash + 1))
+        return {path, ""};
+    return {path.substr(0, dot), path.substr(dot)};
+}
+
+std::string file_stem(const std::string& path) {
+    std::string base = split_extension(path).first;
+    const auto slash = base.find_last_of('/');
+    return slash == std::string::npos ? base : base.substr(slash + 1);
+}
+
+std::string today() {
+    char buf[16];
+    const std::time_t t = std::time(nullptr);
+    std::strftime(buf, sizeof buf, "%Y-%m-%d", std::localtime(&t));
+    return buf;
+}
 
 }  // namespace
 
@@ -47,6 +83,7 @@ public:
     void resume();
     RecorderStatus status();
     const RecordOptions& options() const { return opts_; }
+    const std::vector<std::string>& files() const { return files_; }
 
 private:
     struct Capture {
@@ -87,6 +124,14 @@ private:
     void on_data(Capture& c, const float* data, size_t frames, size_t queued_after);
     int64_t now_frames() const;
     void flush_to(int64_t upto);
+    bool open_writer(const std::string& path, int track);
+    void close_writer();
+    void write_out(const float* samples, size_t frames);
+    void emit(const float* samples, size_t frames);
+    void on_sound(const float* samples, size_t frames);
+    void on_silence(const float* samples, size_t frames);
+    void write_tail();
+    void end_track();
     void tick();
     void note(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
     void error(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -101,7 +146,21 @@ private:
 
     std::map<uint32_t, std::unique_ptr<Capture>> captures_;
     Mixer mixer_;
-    std::unique_ptr<AudioWriter> writer_;
+    std::unique_ptr<AudioWriter> writer_;  // null between tracks
+    std::string current_path_;
+    std::vector<std::string> files_;
+    uint64_t total_frames_ = 0;  // from files already closed
+
+    // Silence handling; only active when split_silence or stop_silence is set.
+    bool silence_mode_ = false;
+    int64_t split_frames_ = 0;
+    int64_t stop_frames_ = 0;
+    std::vector<float> held_;  // recent silence, written only if sound follows
+    int64_t silent_run_ = 0;
+    bool heard_ = false;
+    bool between_tracks_ = false;
+    bool silence_stop_ = false;
+    int track_ = 0;
 
     pa_usec_t start_usec_ = 0;  // 0 until the first audio arrives; shifted forward by time spent paused
     pa_usec_t pause_usec_ = 0;
@@ -140,10 +199,14 @@ std::string recording_path(const std::string& dir, const std::string& label, For
     std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H-%M", std::localtime(&t));
 
     const std::string base = (dir.empty() ? "" : dir + "/") + name + " - " + stamp;
-    const std::string ext = std::string(".") + format_name(format);
-    std::string path = base + ext;
-    for (int n = 2; access(path.c_str(), F_OK) == 0; ++n) path = base + " (" + std::to_string(n) + ")" + ext;
-    return path;
+    return unique_path(base, std::string(".") + format_name(format));
+}
+
+std::string track_path(const std::string& path, int track) {
+    const auto [base, ext] = split_extension(path);
+    char num[16];
+    std::snprintf(num, sizeof num, " - %02d", track);
+    return unique_path(base + num, ext);
 }
 
 void Recorder::Impl::note(const char* fmt, ...) {
@@ -181,24 +244,11 @@ bool Recorder::Impl::start() {
     pa_channel_map_init_extend(&map_, spec_.channels, PA_CHANNEL_MAP_DEFAULT);
     if (opts_.duration > 0) limit_frames_ = std::llround(opts_.duration * opts_.rate);
 
-    EncoderOptions enc;
-    enc.format = opts_.format;
-    enc.rate = opts_.rate;
-    enc.channels = opts_.channels;
-    enc.high_precision = opts_.high_precision;
-    enc.mp3_bitrate = opts_.mp3_bitrate;
-    std::string why;
-    writer_ = make_writer(enc, &why);
-    if (!writer_) {
-        error("%s", why.c_str());
-        return false;
-    }
-    if (!writer_->open(opts_.output)) {
-        error("Cannot create %s: %s", opts_.output.c_str(), writer_->error().c_str());
-        writer_.reset();
-        std::remove(opts_.output.c_str());
-        return false;
-    }
+    if (opts_.split_silence > 0) split_frames_ = std::max<int64_t>(1, std::llround(opts_.split_silence * opts_.rate));
+    if (opts_.stop_silence > 0) stop_frames_ = std::max<int64_t>(1, std::llround(opts_.stop_silence * opts_.rate));
+    silence_mode_ = split_frames_ > 0 || stop_frames_ > 0;
+    if (split_frames_) track_ = 1;
+    if (!open_writer(split_frames_ ? track_path(opts_.output, 1) : opts_.output, track_)) return false;
 
     pa_proplist* props = pa_proplist_new();
     pa_proplist_sets(props, PA_PROP_APPLICATION_ID, "deskrec");
@@ -209,9 +259,7 @@ bool Recorder::Impl::start() {
 
     if (pa_context_connect(ctx_, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
         error("Could not connect to the sound server: %s", pa_strerror(pa_context_errno(ctx_)));
-        writer_->close();
-        writer_.reset();
-        std::remove(opts_.output.c_str());
+        close_writer();
         return false;
     }
     started_ = true;
@@ -513,12 +561,136 @@ void Recorder::Impl::on_data(Capture& c, const float* data, size_t frames, size_
 
 void Recorder::Impl::flush_to(int64_t upto) {
     if (limit_frames_ >= 0) upto = std::min(upto, limit_frames_);
-    mixer_.flush(upto, [this](const float* samples, size_t frames) {
-        if (!write_failed_ && !writer_->write(samples, frames)) {
+    mixer_.flush(upto, [this](const float* samples, size_t frames) { emit(samples, frames); });
+}
+
+// ---------------------------------------------------------------- output files
+
+bool Recorder::Impl::open_writer(const std::string& path, int track) {
+    EncoderOptions enc;
+    enc.format = opts_.format;
+    enc.rate = opts_.rate;
+    enc.channels = opts_.channels;
+    enc.high_precision = opts_.high_precision;
+    enc.mp3_bitrate = opts_.mp3_bitrate;
+    enc.tags = opts_.tags;
+    if (enc.tags.title.empty())
+        enc.tags.title = file_stem(path);
+    else if (track > 0)
+        enc.tags.title += " (" + std::to_string(track) + ")";
+    if (enc.tags.date.empty()) enc.tags.date = today();
+    if (enc.tags.comment.empty()) enc.tags.comment = "Recorded with deskrec";
+    enc.tags.track = track;
+
+    std::string why;
+    auto writer = make_writer(enc, &why);
+    if (!writer) {
+        error("%s", why.c_str());
+        return false;
+    }
+    if (!writer->open(path)) {
+        error("Cannot create %s: %s", path.c_str(), writer->error().c_str());
+        std::remove(path.c_str());
+        return false;
+    }
+    writer_ = std::move(writer);
+    current_path_ = path;
+    files_.push_back(path);
+    return true;
+}
+
+void Recorder::Impl::close_writer() {
+    if (!writer_) return;
+    const uint64_t frames = writer_->frames_written();
+    writer_->close();
+    writer_.reset();
+    if (frames == 0) {
+        std::remove(current_path_.c_str());
+        files_.pop_back();
+    }
+    total_frames_ += frames;
+}
+
+void Recorder::Impl::write_out(const float* samples, size_t frames) {
+    if (write_failed_ || !writer_ || frames == 0) return;
+    if (!writer_->write(samples, frames)) {
+        write_failed_ = true;
+        error("Writing %s failed: %s", current_path_.c_str(), writer_->error().c_str());
+    }
+}
+
+void Recorder::Impl::emit(const float* samples, size_t frames) {
+    if (!silence_mode_) {
+        write_out(samples, frames);
+        return;
+    }
+    const size_t ch = spec_.channels;
+    auto loud = [&](size_t i) {
+        for (size_t c = 0; c < ch; ++c)
+            if (std::fabs(samples[i * ch + c]) > kSilenceLevel) return true;
+        return false;
+    };
+    for (size_t i = 0; i < frames;) {
+        const bool l = loud(i);
+        size_t j = i + 1;
+        while (j < frames && loud(j) == l) ++j;
+        if (l)
+            on_sound(samples + i * ch, j - i);
+        else
+            on_silence(samples + i * ch, j - i);
+        i = j;
+    }
+}
+
+void Recorder::Impl::on_sound(const float* samples, size_t frames) {
+    if (between_tracks_) {
+        between_tracks_ = false;
+        if (!open_writer(track_path(opts_.output, track_ + 1), track_ + 1)) {
             write_failed_ = true;
-            error("Writing %s failed: %s", opts_.output.c_str(), writer_->error().c_str());
+            return;
         }
-    });
+        ++track_;
+        note("Track %d: %s", track_, current_path_.c_str());
+    } else if (heard_ && !held_.empty()) {
+        // Just a quiet moment inside the recording: keep it.
+        write_out(held_.data(), held_.size() / spec_.channels);
+    }
+    held_.clear();
+    silent_run_ = 0;
+    heard_ = true;
+    write_out(samples, frames);
+}
+
+void Recorder::Impl::on_silence(const float* samples, size_t frames) {
+    silent_run_ += int64_t(frames);
+    // Leading silence and the gap between tracks are dropped.
+    if (heard_ && !between_tracks_) {
+        const size_t ch = spec_.channels;
+        held_.insert(held_.end(), samples, samples + frames * ch);
+        const size_t cap = size_t(kMaxHeldSec * spec_.rate) * ch;
+        if (held_.size() > cap) {
+            // Too long to keep in memory: give up on trimming the older half.
+            const size_t out = (held_.size() - cap / 2) / ch;
+            write_out(held_.data(), out);
+            held_.erase(held_.begin(), held_.begin() + std::ptrdiff_t(out * ch));
+        }
+        if (split_frames_ && silent_run_ >= split_frames_) end_track();
+    }
+    if (stop_frames_ && heard_ && silent_run_ >= stop_frames_) silence_stop_ = true;
+}
+
+void Recorder::Impl::write_tail() {
+    const size_t keep = std::min(held_.size() / spec_.channels, size_t(kTailSec * spec_.rate));
+    write_out(held_.data(), keep);
+    held_.clear();
+}
+
+void Recorder::Impl::end_track() {
+    write_tail();
+    const std::string path = current_path_;
+    close_writer();
+    between_tracks_ = true;
+    note("Saved track %d: %s", track_, path.c_str());
 }
 
 void Recorder::Impl::tick_cb(pa_mainloop_api*, pa_time_event*, const struct timeval*, void* ud) {
@@ -551,7 +723,8 @@ void Recorder::Impl::tick() {
 
     if (start_usec_) {
         flush_to(now_frames() - int64_t(kMixDelaySec * spec_.rate));
-        if (write_failed_ || (limit_frames_ >= 0 && mixer_.flushed() >= limit_frames_)) {
+        if (silence_stop_ && !write_failed_) note("Stopping after %g seconds of silence.", opts_.stop_silence);
+        if (write_failed_ || silence_stop_ || (limit_frames_ >= 0 && mixer_.flushed() >= limit_frames_)) {
             stop(write_failed_ ? 1 : 0);
             return;
         }
@@ -559,7 +732,7 @@ void Recorder::Impl::tick() {
 
     if (now - last_sync_ >= kSyncUsec) {
         last_sync_ = now;
-        writer_->sync();
+        if (writer_) writer_->sync();
     }
 
     pa_context_rttime_restart(ctx_, tick_ev_, now + kTickUsec);
@@ -573,6 +746,8 @@ RecorderStatus Recorder::Impl::status() {
     if (opts_.duration > 0) s.seconds = std::min(s.seconds, opts_.duration);
     s.peak = peak_;
     peak_ = 0;
+    s.track = split_frames_ ? track_ : 0;
+    s.between_tracks = between_tracks_;
     for (const auto& [key, cap] : captures_)
         if (cap->stream && !cap->dead) ++s.streams;
     return s;
@@ -582,17 +757,15 @@ void Recorder::Impl::stop(int code) {
     if (!started_ || stopping_) return;
     stopping_ = true;
     if (start_usec_) flush_to(std::max(now_frames(), mixer_.buffered_end()));
+    if (heard_ && !between_tracks_) write_tail();
     if (write_failed_) code = 1;
 
     while (!captures_.empty()) close_capture(captures_.begin()->first, false);
-
-    const uint64_t frames = writer_->frames_written();
-    writer_->close();
-    if (frames == 0) std::remove(opts_.output.c_str());
+    close_writer();
 
     pa_context_set_state_callback(ctx_, nullptr, nullptr);
     pa_context_disconnect(ctx_);
-    if (hooks_.finished) hooks_.finished(code, frames);
+    if (hooks_.finished) hooks_.finished(code, total_frames_);
 }
 
 // ---------------------------------------------------------------- public API
@@ -608,3 +781,4 @@ void Recorder::pause() { impl_->pause(); }
 void Recorder::resume() { impl_->resume(); }
 RecorderStatus Recorder::status() { return impl_->status(); }
 const RecordOptions& Recorder::options() const { return impl_->options(); }
+const std::vector<std::string>& Recorder::files() const { return impl_->files(); }

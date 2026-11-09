@@ -7,12 +7,23 @@
 
 enum class Format { Wav, Flac, Mp3 };
 
+// Written as Vorbis comments (FLAC) or ID3v2 (MP3); WAV files get none.
+// Empty fields are left out.
+struct Tags {
+    std::string title;
+    std::string artist;
+    std::string date;     // YYYY-MM-DD
+    std::string comment;
+    int track = 0;        // 0 = none
+};
+
 struct EncoderOptions {
     Format format = Format::Wav;
     uint32_t rate = 48000;
     uint16_t channels = 2;
     bool high_precision = false;  // WAV: 32-bit float, FLAC: 24-bit
     int mp3_bitrate = 0;          // kbps; 0 = high-quality VBR
+    Tags tags;
 };
 
 // Encodes interleaved float samples (nominal range -1..1) into a file.

@@ -1,5 +1,6 @@
 #include "audio_writer.hpp"
 
+#include <FLAC/metadata.h>
 #include <FLAC/stream_encoder.h>
 
 #include <algorithm>
@@ -8,11 +9,18 @@
 
 namespace {
 
+void add_comment(FLAC__StreamMetadata* block, const char* name, const std::string& value) {
+    if (value.empty()) return;
+    FLAC__StreamMetadata_VorbisComment_Entry entry;
+    if (FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&entry, name, value.c_str()))
+        FLAC__metadata_object_vorbiscomment_append_comment(block, entry, /*copy=*/false);
+}
+
 // Lossless FLAC: 16-bit, or 24-bit in high-precision mode.
 class FlacWriter : public AudioWriter {
 public:
     explicit FlacWriter(const EncoderOptions& opts)
-        : rate_(opts.rate), channels_(opts.channels), bits_(opts.high_precision ? 24 : 16) {}
+        : rate_(opts.rate), channels_(opts.channels), bits_(opts.high_precision ? 24 : 16), tags_(opts.tags) {}
     FlacWriter(const FlacWriter&) = delete;
     FlacWriter& operator=(const FlacWriter&) = delete;
     ~FlacWriter() override { close(); }
@@ -29,6 +37,17 @@ public:
         FLAC__stream_encoder_set_sample_rate(enc_, rate_);
         FLAC__stream_encoder_set_compression_level(enc_, 5);
 
+        // The block must stay alive until the encoder is finished.
+        meta_ = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
+        if (meta_) {
+            add_comment(meta_, "TITLE", tags_.title);
+            add_comment(meta_, "ARTIST", tags_.artist);
+            add_comment(meta_, "DATE", tags_.date);
+            add_comment(meta_, "COMMENT", tags_.comment);
+            if (tags_.track > 0) add_comment(meta_, "TRACKNUMBER", std::to_string(tags_.track));
+            FLAC__stream_encoder_set_metadata(enc_, &meta_, 1);
+        }
+
         const auto status = FLAC__stream_encoder_init_file(enc_, path.c_str(), nullptr, nullptr);
         if (status != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
             error_ = status == FLAC__STREAM_ENCODER_INIT_STATUS_ENCODER_ERROR
@@ -36,6 +55,7 @@ public:
                          : FLAC__StreamEncoderInitStatusString[status];
             FLAC__stream_encoder_delete(enc_);
             enc_ = nullptr;
+            free_meta();
             return false;
         }
         frames_ = 0;
@@ -63,13 +83,21 @@ public:
         FLAC__stream_encoder_finish(enc_);
         FLAC__stream_encoder_delete(enc_);
         enc_ = nullptr;
+        free_meta();
     }
 
 private:
+    void free_meta() {
+        if (meta_) FLAC__metadata_object_delete(meta_);
+        meta_ = nullptr;
+    }
+
     FLAC__StreamEncoder* enc_ = nullptr;
+    FLAC__StreamMetadata* meta_ = nullptr;
     uint32_t rate_;
     uint16_t channels_;
     unsigned bits_;
+    Tags tags_;
     std::vector<FLAC__int32> buf_;
 };
 

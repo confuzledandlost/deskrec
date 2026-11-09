@@ -44,15 +44,24 @@ and press Record before it starts playing. System sounds (notification and
 volume-change sounds, speech-dispatcher's silent placeholder stream) aren't
 listed, but "All desktop audio" still includes them.
 
-Choose the format and the folder at the bottom of the window (default: WAV in
-your Music folder); both are remembered in `~/.config/deskrec/settings.ini`.
-Files are named after the source and the time, e.g.
-`Firefox - 2026-11-08 23-40.flac`; a number is added if that name is taken.
+Below the list you can choose the format and its quality, the folder (default:
+WAV in your Music folder), and what to do on silence:
+
+- **New track after N seconds of silence** saves each song or clip as its own
+  numbered file (`... - 01.flac`, `... - 02.flac`), with the gaps left out.
+- **Stop after N seconds of silence** ends the recording on its own once
+  playback has finished.
+
+All of these are remembered in `~/.config/deskrec/settings.ini`. Files are
+named after the source and the time, e.g. `Firefox - 2026-11-08 23-40.flac`; a
+number is added if that name is taken. FLAC and MP3 files are also tagged with
+a title, the source as artist, the date, and the track number when splitting.
 
 While recording, a level meter shows how loud the captured audio is, and
 Pause/Resume skips over parts you don't want. The result is one file with no
-gap where the pause was. Closing the window while recording saves what you have
-so far.
+gap where the pause was. If a recording finishes while the window isn't
+focused (e.g. auto-stop), you get a desktop notification. Closing the window
+while recording saves what you have so far.
 
 ## Command line
 
@@ -66,6 +75,9 @@ deskrec record -s <output-name>       # a specific output (headphones, HDMI, ...
 deskrec record -d 60 -o clip.wav      # stop after 60 seconds
 deskrec record -o song.flac           # format follows the file extension
 deskrec record -F mp3 -b 320          # or pick it explicitly
+deskrec record -a firefox -F flac --split 2 --auto-stop 30
+                                      # one file per song; stop when playback ends
+deskrec record --title "Interview" --artist "Podcast"   # FLAC/MP3 tags
 ```
 
 | Format | Option    | Quality                                    | Size (stereo, 48 kHz) |
@@ -76,12 +88,19 @@ deskrec record -F mp3 -b 320          # or pick it explicitly
 
 Without `-o`, the file goes in the current directory and is named after what
 you record, e.g. `Firefox - 2026-11-08 23-40.wav` or
-`Desktop audio - 2026-11-08 23-40.wav`. Stop a recording with Ctrl+C. Run
-`deskrec --help` for all options.
+`Desktop audio - 2026-11-08 23-40.wav`. Run `deskrec --help` for all options.
+
+While recording in a terminal, press **space** (or `p`) to pause and resume and
+**q** (or Ctrl+C) to stop. From another terminal or a keyboard shortcut,
+`pkill -USR1 -x deskrec` toggles pause (`-x` keeps it from matching
+`deskrec-gui`).
 
 Behaviour worth knowing:
 
 - Recording starts when the first audio arrives, so there's no leading silence.
+- Silence means below -60 dBFS. With `--split` or `--auto-stop`, silence at the
+  start is skipped and each file keeps only half a second of trailing silence.
+  `--split` accepts up to 30 seconds.
 - In app mode (`-a`), deskrec follows the app: streams that start later, move to
   another output or end are picked up and dropped automatically, and multiple
   streams (e.g. several browser tabs) are mixed into one file. While the app is
@@ -94,6 +113,7 @@ Behaviour worth knowing:
   process gets killed (FLAC and MP3 players may show a wrong duration then).
 - WAV files are limited to 4 GB, about 6 hours at 48 kHz stereo 16-bit.
   FLAC and MP3 have no practical limit.
+- WAV files have no tags; FLAC uses Vorbis comments and MP3 uses ID3v2.
 
 ## Code layout
 

@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -13,7 +14,7 @@ namespace {
 class Mp3Writer : public AudioWriter {
 public:
     explicit Mp3Writer(const EncoderOptions& opts)
-        : rate_(opts.rate), channels_(opts.channels), bitrate_(opts.mp3_bitrate) {}
+        : rate_(opts.rate), channels_(opts.channels), bitrate_(opts.mp3_bitrate), tags_(opts.tags) {}
     Mp3Writer(const Mp3Writer&) = delete;
     Mp3Writer& operator=(const Mp3Writer&) = delete;
     ~Mp3Writer() override { close(); }
@@ -41,6 +42,16 @@ public:
             lame_set_VBR(lame_, vbr_default);
             lame_set_VBR_quality(lame_, 2.0f);
         }
+
+        // LAME puts the ID3v2 tag at the front of the first encoded output.
+        id3tag_init(lame_);
+        id3tag_v2_only(lame_);
+        if (!tags_.title.empty()) id3tag_set_title(lame_, tags_.title.c_str());
+        if (!tags_.artist.empty()) id3tag_set_artist(lame_, tags_.artist.c_str());
+        if (tags_.date.size() >= 4) id3tag_set_year(lame_, tags_.date.substr(0, 4).c_str());
+        if (!tags_.comment.empty()) id3tag_set_comment(lame_, tags_.comment.c_str());
+        if (tags_.track > 0) id3tag_set_track(lame_, std::to_string(tags_.track).c_str());
+
         if (lame_init_params(lame_) < 0) {
             error_ = "the MP3 encoder rejected this sample rate / bitrate combination";
             lame_close(lame_);
@@ -100,6 +111,7 @@ private:
     uint32_t rate_;
     uint16_t channels_;
     int bitrate_;
+    Tags tags_;
     std::vector<unsigned char> out_;
 };
 

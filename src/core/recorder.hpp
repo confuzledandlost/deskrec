@@ -21,6 +21,12 @@ struct RecordOptions {
     Format format = Format::Wav;
     bool high_precision = false;     // WAV: 32-bit float, FLAC: 24-bit
     int mp3_bitrate = 0;             // kbps; 0 = VBR
+    // Empty title = the file's name; empty date = today. When splitting, each
+    // file gets its track number.
+    Tags tags;
+    // With either of these set, silence at the start and end is trimmed.
+    double split_silence = 0;        // seconds; start a new file after a silent gap this long
+    double stop_silence = 0;         // seconds; stop after this much silence (once audio was heard)
 
     bool app_mode() const { return !apps.empty() || !indices.empty(); }
 };
@@ -31,6 +37,8 @@ struct RecorderStatus {
     double seconds = 0;
     float peak = 0;        // linear peak since the previous status() call
     size_t streams = 0;    // capture streams currently delivering audio
+    int track = 0;         // current track when splitting, else 0
+    bool between_tracks = false;  // splitting: the last track ended, waiting for sound
 };
 
 // Records on a caller-provided PulseAudio main loop; hooks run on that loop.
@@ -39,9 +47,10 @@ public:
     struct Hooks {
         std::function<void(const std::string&)> note;
         std::function<void(const std::string&)> error;
-        // Runs once when recording ends (stop(), duration reached, or failure),
-        // after the file is closed. frames == 0 means nothing was captured and
-        // the file was deleted. Must not destroy the Recorder synchronously.
+        // Runs once when recording ends (stop(), duration or silence limit
+        // reached, or failure), after the files are closed. frames is the total
+        // over all files; 0 means nothing was captured and no file was kept.
+        // Must not destroy the Recorder synchronously.
         std::function<void(int code, uint64_t frames)> finished;
     };
 
@@ -60,6 +69,8 @@ public:
     void resume();
     RecorderStatus status();
     const RecordOptions& options() const;
+    // Files written so far (several when splitting into tracks).
+    const std::vector<std::string>& files() const;
 
 private:
     class Impl;
@@ -71,3 +82,6 @@ std::string format_duration(double seconds);  // HH:MM:SS
 // "<dir>/<label> - YYYY-MM-DD HH-MM.<ext>", with " (2)", " (3)", ... appended if
 // that file already exists. An empty dir means the current directory.
 std::string recording_path(const std::string& dir, const std::string& label, Format format);
+
+// "<path without extension> - NN.<ext>", made unique the same way.
+std::string track_path(const std::string& path, int track);

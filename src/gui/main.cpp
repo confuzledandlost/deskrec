@@ -29,6 +29,24 @@ struct SourceEntry {
     std::string file_label;  // used in the recording's filename
 };
 
+struct QualityOption {
+    const char* key;    // stored in settings.ini
+    const char* label;
+    bool high_precision;
+    int mp3_bitrate;
+};
+
+const std::vector<QualityOption>& quality_options(Format f) {
+    static const std::vector<QualityOption> wav = {{"16bit", "16-bit", false, 0}, {"float", "32-bit float", true, 0}};
+    static const std::vector<QualityOption> flac = {{"16bit", "16-bit", false, 0}, {"24bit", "24-bit", true, 0}};
+    static const std::vector<QualityOption> mp3 = {{"vbr", "VBR (~190 kbps)", false, 0},
+                                                   {"320", "320 kbps", false, 320},
+                                                   {"256", "256 kbps", false, 256},
+                                                   {"192", "192 kbps", false, 192},
+                                                   {"128", "128 kbps", false, 128}};
+    return f == Format::Wav ? wav : f == Format::Flac ? flac : mp3;
+}
+
 // Apps stay listed after their audio stops, so you can pick one and press
 // Record before it starts playing again.
 struct SeenApp {
@@ -48,12 +66,24 @@ struct App {
     GtkWidget* open_btn = nullptr;
     GtkWidget* meter = nullptr;
     double meter_level = 0;
+    GtkWidget* settings_grid = nullptr;
     GtkWidget* format_dropdown = nullptr;
+    GtkWidget* quality_dropdown = nullptr;
     GtkWidget* folder_btn = nullptr;
+    GtkWidget* split_check = nullptr;
+    GtkWidget* split_spin = nullptr;
+    GtkWidget* stop_check = nullptr;
+    GtkWidget* stop_spin = nullptr;
+    bool loading_ui = false;
 
     // Settings, persisted in ~/.config/deskrec/settings.ini.
     Format format = Format::Wav;
+    std::map<Format, std::string> quality;  // format -> QualityOption::key
     std::string folder;
+    bool split_enabled = false;
+    int split_seconds = 2;
+    bool stop_enabled = false;
+    int stop_seconds = 30;
     std::vector<Format> formats;  // dropdown index -> format
 
     pa_glib_mainloop* pa_loop = nullptr;
@@ -67,7 +97,7 @@ struct App {
 
     std::string recording_title;
     std::string last_error;
-    std::string last_file;
+    std::vector<std::string> last_files;
     uint32_t recording_rate = 0;
     int finished_code = 0;
     uint64_t finished_frames = 0;
@@ -120,6 +150,23 @@ void load_settings(App& app) {
             if (g_file_test(dir, G_FILE_TEST_IS_DIR)) app.folder = dir;
             g_free(dir);
         }
+        for (Format f : {Format::Wav, Format::Flac, Format::Mp3}) {
+            const std::string key = std::string(format_name(f)) + "-quality";
+            if (char* q = g_key_file_get_string(kf, "recording", key.c_str(), nullptr)) {
+                app.quality[f] = q;
+                g_free(q);
+            }
+        }
+        auto get_int = [&](const char* key, int lo, int hi, int& out) {
+            GError* err = nullptr;
+            const int v = g_key_file_get_integer(kf, "silence", key, &err);
+            if (err) g_error_free(err);
+            else out = std::clamp(v, lo, hi);
+        };
+        app.split_enabled = g_key_file_get_boolean(kf, "silence", "split", nullptr);
+        app.stop_enabled = g_key_file_get_boolean(kf, "silence", "stop", nullptr);
+        get_int("split-seconds", 1, 30, app.split_seconds);
+        get_int("stop-seconds", 5, 600, app.stop_seconds);
     }
     g_key_file_free(kf);
 }
@@ -128,6 +175,12 @@ void save_settings(const App& app) {
     GKeyFile* kf = g_key_file_new();
     g_key_file_set_string(kf, "recording", "format", format_name(app.format));
     g_key_file_set_string(kf, "recording", "folder", app.folder.c_str());
+    for (const auto& [f, q] : app.quality)
+        g_key_file_set_string(kf, "recording", (std::string(format_name(f)) + "-quality").c_str(), q.c_str());
+    g_key_file_set_boolean(kf, "silence", "split", app.split_enabled);
+    g_key_file_set_integer(kf, "silence", "split-seconds", app.split_seconds);
+    g_key_file_set_boolean(kf, "silence", "stop", app.stop_enabled);
+    g_key_file_set_integer(kf, "silence", "stop-seconds", app.stop_seconds);
 
     const std::string path = settings_path();
     char* dir = g_path_get_dirname(path.c_str());
@@ -144,11 +197,54 @@ void update_folder_button(App& app) {
     g_free(base);
 }
 
+const QualityOption& current_quality(const App& app) {
+    const auto& options = quality_options(app.format);
+    const auto it = app.quality.find(app.format);
+    if (it != app.quality.end())
+        for (const auto& o : options)
+            if (it->second == o.key) return o;
+    return options.front();
+}
+
+void update_quality_dropdown(App& app) {
+    app.loading_ui = true;
+    const auto& options = quality_options(app.format);
+    GtkStringList* labels = gtk_string_list_new(nullptr);
+    for (const auto& o : options) gtk_string_list_append(labels, o.label);
+    gtk_drop_down_set_model(GTK_DROP_DOWN(app.quality_dropdown), G_LIST_MODEL(labels));
+    g_object_unref(labels);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(app.quality_dropdown), guint(&current_quality(app) - options.data()));
+    app.loading_ui = false;
+}
+
 void on_format_changed(GObject* dropdown, GParamSpec*, gpointer ud) {
     auto& app = *static_cast<App*>(ud);
     const guint idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
     if (idx >= app.formats.size()) return;
     app.format = app.formats[idx];
+    update_quality_dropdown(app);
+    save_settings(app);
+}
+
+void on_quality_changed(GObject* dropdown, GParamSpec*, gpointer ud) {
+    auto& app = *static_cast<App*>(ud);
+    if (app.loading_ui) return;
+    const auto& options = quality_options(app.format);
+    const guint idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
+    if (idx >= options.size()) return;
+    app.quality[app.format] = options[idx].key;
+    save_settings(app);
+}
+
+void on_silence_changed(GtkWidget*, gpointer ud) {
+    auto& app = *static_cast<App*>(ud);
+    if (app.loading_ui) return;
+    app.split_enabled = gtk_check_button_get_active(GTK_CHECK_BUTTON(app.split_check));
+    app.stop_enabled = gtk_check_button_get_active(GTK_CHECK_BUTTON(app.stop_check));
+    app.split_seconds = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app.split_spin));
+    app.stop_seconds = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app.stop_spin));
+    gtk_widget_set_sensitive(app.split_spin, app.split_enabled);
+    gtk_widget_set_sensitive(app.stop_spin, app.stop_enabled);
     save_settings(app);
 }
 
@@ -309,8 +405,7 @@ void set_recording_ui(App& app, bool recording) {
         gtk_widget_add_css_class(app.record_btn, "suggested-action");
     }
     gtk_widget_set_sensitive(app.list, !recording);
-    gtk_widget_set_sensitive(app.format_dropdown, !recording);
-    gtk_widget_set_sensitive(app.folder_btn, !recording);
+    gtk_widget_set_sensitive(app.settings_grid, !recording);
 
     gtk_button_set_label(GTK_BUTTON(app.pause_btn), "Pause");
     gtk_widget_set_visible(app.pause_btn, recording);
@@ -326,10 +421,13 @@ gboolean on_status_tick(gpointer ud) {
         return G_SOURCE_REMOVE;
     }
     const RecorderStatus s = app.recorder->status();
+    const std::string track = s.track > 0 ? ", track " + std::to_string(s.track) : "";
     if (s.paused)
         set_status(app, "Paused   " + format_duration(s.seconds));
+    else if (s.between_tracks)
+        set_status(app, "Waiting for the next track...   " + format_duration(s.seconds));
     else if (s.started)
-        set_status(app, "Recording " + app.recording_title + "   " + format_duration(s.seconds));
+        set_status(app, "Recording " + app.recording_title + track + "   " + format_duration(s.seconds));
     else
         set_status(app, "Waiting for " + app.recording_title + " to play audio...");
 
@@ -353,6 +451,41 @@ void on_pause_clicked(GtkButton*, gpointer ud) {
     on_status_tick(&app);
 }
 
+void show_file(App& app, const std::string& path) {
+    GFile* file = g_file_new_for_path(path.c_str());
+#if GTK_CHECK_VERSION(4, 10, 0)
+    GtkFileLauncher* launcher = gtk_file_launcher_new(file);
+    gtk_file_launcher_open_containing_folder(launcher, GTK_WINDOW(app.window), nullptr, nullptr, nullptr);
+    g_object_unref(launcher);
+#else
+    GFile* dir = g_file_get_parent(file);
+    char* uri = g_file_get_uri(dir);
+    gtk_show_uri(GTK_WINDOW(app.window), uri, GDK_CURRENT_TIME);
+    g_free(uri);
+    g_object_unref(dir);
+#endif
+    g_object_unref(file);
+}
+
+void on_show_file_action(GSimpleAction*, GVariant* param, gpointer ud) {
+    show_file(*static_cast<App*>(ud), g_variant_get_string(param, nullptr));
+}
+
+// Only when the window isn't focused (e.g. auto-stop fired while you were in
+// another app); otherwise the status line already says it.
+void notify(App& app, const std::string& title, const std::string& body) {
+    if (gtk_window_is_active(GTK_WINDOW(app.window))) return;
+    GNotification* n = g_notification_new(title.c_str());
+    g_notification_set_body(n, body.c_str());
+    GIcon* icon = g_themed_icon_new("audio-input-microphone");
+    g_notification_set_icon(n, icon);
+    g_object_unref(icon);
+    if (!app.last_files.empty())
+        g_notification_add_button_with_target(n, "Show file", "app.show-file", "s", app.last_files.back().c_str());
+    g_application_send_notification(G_APPLICATION(app.gapp), "recording-finished", n);
+    g_object_unref(n);
+}
+
 gboolean on_finished_idle(gpointer ud) {
     auto& app = *static_cast<App*>(ud);
     app.finished_idle = 0;
@@ -363,14 +496,27 @@ gboolean on_finished_idle(gpointer ud) {
     }
     set_recording_ui(app, false);
 
+    const std::string length = format_duration(double(app.finished_frames) / app.recording_rate);
     if (app.finished_code != 0 && !app.last_error.empty()) {
         set_status(app, "Recording failed: " + app.last_error);
-    } else if (app.finished_frames == 0) {
+        notify(app, "Recording failed", app.last_error);
+    } else if (app.finished_frames == 0 || app.last_files.empty()) {
         set_status(app, "Nothing was recorded (no audio played).");
     } else {
-        char* base = g_path_get_basename(app.last_file.c_str());
-        set_status(app, "Saved " + format_duration(double(app.finished_frames) / app.recording_rate) + " to " + base);
-        g_free(base);
+        std::string where;
+        if (app.last_files.size() == 1) {
+            char* base = g_path_get_basename(app.last_files[0].c_str());
+            where = std::string("to ") + base;
+            g_free(base);
+        } else {
+            char* dir = g_path_get_dirname(app.last_files[0].c_str());
+            char* base = g_path_get_basename(dir);
+            where = "as " + std::to_string(app.last_files.size()) + " tracks in " + base;
+            g_free(base);
+            g_free(dir);
+        }
+        set_status(app, "Saved " + length + " " + where);
+        notify(app, "Recording saved", "Saved " + length + " of " + app.recording_title + " " + where);
         gtk_widget_set_visible(app.open_btn, TRUE);
     }
     return G_SOURCE_REMOVE;
@@ -384,13 +530,19 @@ void start_recording(App& app) {
 
     RecordOptions opts;
     opts.format = app.format;
+    const QualityOption& quality = current_quality(app);
+    opts.high_precision = quality.high_precision;
+    opts.mp3_bitrate = quality.mp3_bitrate;
+    if (app.split_enabled) opts.split_silence = app.split_seconds;
+    if (app.stop_enabled) opts.stop_silence = app.stop_seconds;
+    opts.tags.artist = entry->file_label;
     if (entry->kind == SourceKind::Output) opts.sink = entry->target;
     if (entry->kind == SourceKind::App) opts.apps.push_back(entry->target);
     g_mkdir_with_parents(app.folder.c_str(), 0755);
     opts.output = recording_path(app.folder, entry->file_label, opts.format);
 
     app.last_error.clear();
-    app.last_file = opts.output;
+    app.last_files.clear();
     app.recording_title = entry->title;
     app.recording_rate = opts.rate;
 
@@ -402,6 +554,7 @@ void start_recording(App& app) {
     hooks.finished = [&app](int code, uint64_t frames) {
         app.finished_code = code;
         app.finished_frames = frames;
+        app.last_files = app.recorder->files();
         // The recorder is still on the call stack here; tear it down from idle.
         app.finished_idle = g_idle_add(on_finished_idle, &app);
     };
@@ -429,19 +582,7 @@ void on_record_clicked(GtkButton*, gpointer ud) {
 
 void on_open_clicked(GtkButton*, gpointer ud) {
     auto& app = *static_cast<App*>(ud);
-    GFile* file = g_file_new_for_path(app.last_file.c_str());
-#if GTK_CHECK_VERSION(4, 10, 0)
-    GtkFileLauncher* launcher = gtk_file_launcher_new(file);
-    gtk_file_launcher_open_containing_folder(launcher, GTK_WINDOW(app.window), nullptr, nullptr, nullptr);
-    g_object_unref(launcher);
-#else
-    GFile* dir = g_file_get_parent(file);
-    char* uri = g_file_get_uri(dir);
-    gtk_show_uri(GTK_WINDOW(app.window), uri, GDK_CURRENT_TIME);
-    g_free(uri);
-    g_object_unref(dir);
-#endif
-    g_object_unref(file);
+    if (!app.last_files.empty()) show_file(app, app.last_files.back());
 }
 
 gboolean on_close_request(GtkWindow*, gpointer ud) {
@@ -466,6 +607,11 @@ void on_activate(GtkApplication* gapp, gpointer ud) {
     }
 
     load_settings(app);
+
+    GSimpleAction* show_action = g_simple_action_new("show-file", G_VARIANT_TYPE_STRING);
+    g_signal_connect(show_action, "activate", G_CALLBACK(on_show_file_action), &app);
+    g_action_map_add_action(G_ACTION_MAP(gapp), G_ACTION(show_action));
+    g_object_unref(show_action);
 
     app.window = gtk_application_window_new(gapp);
     gtk_window_set_title(GTK_WINDOW(app.window), "deskrec");
@@ -495,10 +641,16 @@ void on_activate(GtkApplication* gapp, gpointer ud) {
     gtk_frame_set_child(GTK_FRAME(frame), scroller);
     gtk_box_append(GTK_BOX(box), frame);
 
-    GtkWidget* settings = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget* format_label = gtk_label_new("Format");
-    gtk_widget_add_css_class(format_label, "dim-label");
-    gtk_box_append(GTK_BOX(settings), format_label);
+    app.settings_grid = gtk_grid_new();
+    GtkGrid* grid = GTK_GRID(app.settings_grid);
+    gtk_grid_set_row_spacing(grid, 8);
+    gtk_grid_set_column_spacing(grid, 8);
+    auto add_label = [grid](const char* text, int row) {
+        GtkWidget* label = gtk_label_new(text);
+        gtk_label_set_xalign(GTK_LABEL(label), 0);
+        gtk_widget_add_css_class(label, "dim-label");
+        gtk_grid_attach(grid, label, 0, row, 1, 1);
+    };
 
     std::vector<std::string> names;
     for (Format f : {Format::Wav, Format::Flac, Format::Mp3}) {
@@ -514,21 +666,50 @@ void on_activate(GtkApplication* gapp, gpointer ud) {
     app.format_dropdown = gtk_drop_down_new_from_strings(c_names.data());
     const auto current = std::find(app.formats.begin(), app.formats.end(), app.format);
     gtk_drop_down_set_selected(GTK_DROP_DOWN(app.format_dropdown), guint(current - app.formats.begin()));
+    gtk_widget_set_hexpand(app.format_dropdown, TRUE);
+    app.quality_dropdown = gtk_drop_down_new(nullptr, nullptr);
+    gtk_widget_set_tooltip_text(app.quality_dropdown, "Quality");
+    update_quality_dropdown(app);
     g_signal_connect(app.format_dropdown, "notify::selected", G_CALLBACK(on_format_changed), &app);
-    gtk_box_append(GTK_BOX(settings), app.format_dropdown);
+    g_signal_connect(app.quality_dropdown, "notify::selected", G_CALLBACK(on_quality_changed), &app);
+    add_label("Format", 0);
+    gtk_grid_attach(grid, app.format_dropdown, 1, 0, 1, 1);
+    gtk_grid_attach(grid, app.quality_dropdown, 2, 0, 1, 1);
 
-    GtkWidget* spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_set_hexpand(spacer, TRUE);
-    gtk_box_append(GTK_BOX(settings), spacer);
-
-    GtkWidget* folder_label = gtk_label_new("Save to");
-    gtk_widget_add_css_class(folder_label, "dim-label");
-    gtk_box_append(GTK_BOX(settings), folder_label);
+    add_label("Save to", 1);
     app.folder_btn = gtk_button_new();
     update_folder_button(app);
     g_signal_connect(app.folder_btn, "clicked", G_CALLBACK(on_folder_clicked), &app);
-    gtk_box_append(GTK_BOX(settings), app.folder_btn);
-    gtk_box_append(GTK_BOX(box), settings);
+    gtk_grid_attach(grid, app.folder_btn, 1, 1, 2, 1);
+
+    // "[x] <check_text> [spin] seconds of silence" on one grid row; the size
+    // group lines the spin buttons up.
+    GtkSizeGroup* checks = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+    auto add_silence_row = [&](int row, const char* check_text, int lo, int hi, bool on, int value, const char* tip,
+                               GtkWidget*& check, GtkWidget*& spin) {
+        GtkWidget* line = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        check = gtk_check_button_new_with_label(check_text);
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(check), on);
+        gtk_widget_set_tooltip_text(check, tip);
+        gtk_size_group_add_widget(checks, check);
+        spin = gtk_spin_button_new_with_range(lo, hi, 1);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), value);
+        gtk_widget_set_sensitive(spin, on);
+        gtk_box_append(GTK_BOX(line), check);
+        gtk_box_append(GTK_BOX(line), spin);
+        gtk_box_append(GTK_BOX(line), gtk_label_new("seconds of silence"));
+        g_signal_connect(check, "toggled", G_CALLBACK(on_silence_changed), &app);
+        g_signal_connect(spin, "value-changed", G_CALLBACK(on_silence_changed), &app);
+        gtk_grid_attach(grid, line, 1, row, 2, 1);
+    };
+    add_label("Silence", 2);
+    add_silence_row(2, "New track after", 1, 30, app.split_enabled, app.split_seconds,
+                    "Save each song or clip as its own file, numbered - 01, - 02, ...", app.split_check,
+                    app.split_spin);
+    add_silence_row(3, "Stop after", 5, 600, app.stop_enabled, app.stop_seconds,
+                    "Stop recording on its own once playback has finished", app.stop_check, app.stop_spin);
+    g_object_unref(checks);
+    gtk_box_append(GTK_BOX(box), app.settings_grid);
 
     app.status = gtk_label_new(nullptr);
     gtk_label_set_xalign(GTK_LABEL(app.status), 0);

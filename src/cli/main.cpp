@@ -3,6 +3,7 @@
 
 #include <getopt.h>
 #include <pulse/pulseaudio.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -42,10 +43,16 @@ Record options:
                           (default: 16-bit)
   -b, --bitrate KBPS      MP3 constant bitrate, 8-320 (default: high-quality VBR,
                           around 190 kbps)
+      --split SECS        Start a new file ("<name> - 01", "- 02", ...) after
+                          SECS seconds of silence (1-30), e.g. between songs
+      --auto-stop SECS    Stop after SECS seconds of silence
+      --title TEXT        Title tag (FLAC/MP3; default: the file name)
+      --artist TEXT       Artist tag (FLAC/MP3; default: what is being recorded)
   -q, --quiet             No status output
   -h, --help              Show this help
 
-Recording starts when the first audio arrives. Stop it with Ctrl+C.
+Recording starts when the first audio arrives. Stop it with Ctrl+C (or q).
+Press space to pause and resume, or from elsewhere: pkill -USR1 -x deskrec
 )";
 
 // ---------------------------------------------------------------- list
@@ -116,11 +123,18 @@ public:
         const int bars = std::clamp(int((db + 60.0f) / 60.0f * kWidth + 0.5f), 0, kWidth);
         const std::string meter = std::string(size_t(bars), '#') + std::string(size_t(kWidth - bars), '.');
         const char* plural = s.streams == 1 ? "" : "s";
+        const std::string track = s.track > 0 ? "  track " + std::to_string(s.track) : "";
         if (!s.started)
             std::fprintf(stderr, "\r\033[K  waiting for audio...  [%zu stream%s]", s.streams, plural);
+        else if (s.paused)
+            std::fprintf(stderr, "\r\033[K  PAUSED %s%s  (space to resume)", format_duration(s.seconds).c_str(),
+                         track.c_str());
+        else if (s.between_tracks)
+            std::fprintf(stderr, "\r\033[K  REC %s  waiting for the next track...", format_duration(s.seconds).c_str());
         else
-            std::fprintf(stderr, "\r\033[K  REC %s  [%s] %5.1f dB  [%zu stream%s]", format_duration(s.seconds).c_str(),
-                         meter.c_str(), double(std::max(db, -99.9f)), s.streams, plural);
+            std::fprintf(stderr, "\r\033[K  REC %s%s  [%s] %5.1f dB  [%zu stream%s]",
+                         format_duration(s.seconds).c_str(), track.c_str(), meter.c_str(),
+                         double(std::max(db, -99.9f)), s.streams, plural);
         std::fflush(stderr);
         dirty_ = true;
     }
@@ -142,7 +156,56 @@ struct RecordSession {
     std::unique_ptr<Recorder> recorder;
     StatusLine status{false};
     pa_time_event* status_ev = nullptr;
+    pa_io_event* key_ev = nullptr;
+    termios saved_tty{};
+    bool tty_changed = false;
+    bool quiet = false;
 };
+
+void toggle_pause(RecordSession& s) {
+    const bool paused = s.recorder->status().paused;
+    if (paused)
+        s.recorder->resume();
+    else
+        s.recorder->pause();
+    if (!s.quiet) s.status.log(paused ? "Resumed." : "Paused.");
+    s.status.show(s.recorder->status());
+}
+
+// Single-key controls while recording in the foreground of a terminal: space
+// or p toggles pause, q stops. Ctrl+C keeps working (ISIG stays on).
+void enable_keys(RecordSession& s) {
+    if (!isatty(STDIN_FILENO) || tcgetpgrp(STDIN_FILENO) != getpgrp()) return;
+    if (tcgetattr(STDIN_FILENO, &s.saved_tty) != 0) return;
+    termios raw = s.saved_tty;
+    raw.c_lflag &= tcflag_t(~(ICANON | ECHO));
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
+    s.tty_changed = true;
+    s.key_ev = s.api->io_new(
+        s.api, STDIN_FILENO, PA_IO_EVENT_INPUT,
+        [](pa_mainloop_api* api, pa_io_event* e, int fd, pa_io_event_flags_t, void* ud) {
+            auto& self = *static_cast<RecordSession*>(ud);
+            char key = 0;
+            const ssize_t n = read(fd, &key, 1);
+            if (n <= 0) {
+                api->io_free(e);
+                self.key_ev = nullptr;
+                return;
+            }
+            if (key == ' ' || key == 'p' || key == 'P') toggle_pause(self);
+            if (key == 'q' || key == 'Q') self.recorder->stop();
+        },
+        &s);
+}
+
+void restore_keys(RecordSession& s) {
+    if (s.key_ev) s.api->io_free(s.key_ev);
+    s.key_ev = nullptr;
+    if (s.tty_changed) tcsetattr(STDIN_FILENO, TCSANOW, &s.saved_tty);
+    s.tty_changed = false;
+}
 
 void schedule_status(RecordSession& s) {
     timeval tv;
@@ -166,6 +229,7 @@ int run_record(const RecordOptions& opts, bool quiet) {
     s.ml = pa_mainloop_new();
     s.api = pa_mainloop_get_api(s.ml);
     s.status = StatusLine(!quiet && isatty(STDERR_FILENO));
+    s.quiet = quiet;
     pa_signal_init(s.api);
 
     Recorder::Hooks hooks;
@@ -176,26 +240,37 @@ int run_record(const RecordOptions& opts, bool quiet) {
     hooks.finished = [&](int code, uint64_t frames) {
         s.status.clear();
         if (!quiet) {
-            s.status.log(frames == 0 ? std::string("No audio was captured; nothing saved.")
-                                     : "Saved " + format_duration(double(frames) / opts.rate) + " of audio to " +
-                                           opts.output);
+            const auto& files = s.recorder->files();
+            const std::string length = format_duration(double(frames) / opts.rate);
+            if (frames == 0)
+                s.status.log("No audio was captured; nothing saved.");
+            else if (files.size() == 1)
+                s.status.log("Saved " + length + " of audio to " + files[0]);
+            else
+                s.status.log("Saved " + length + " of audio in " + std::to_string(files.size()) + " tracks.");
         }
         pa_mainloop_quit(s.ml, code);
     };
     s.recorder = std::make_unique<Recorder>(s.api, opts, hooks);
 
-    auto on_signal = [](pa_mainloop_api*, pa_signal_event*, int, void* ud) {
+    auto on_stop_signal = [](pa_mainloop_api*, pa_signal_event*, int, void* ud) {
         static_cast<RecordSession*>(ud)->recorder->stop();
     };
-    pa_signal_new(SIGINT, on_signal, &s);
-    pa_signal_new(SIGTERM, on_signal, &s);
+    auto on_pause_signal = [](pa_mainloop_api*, pa_signal_event*, int, void* ud) {
+        toggle_pause(*static_cast<RecordSession*>(ud));
+    };
+    pa_signal_new(SIGINT, on_stop_signal, &s);
+    pa_signal_new(SIGTERM, on_stop_signal, &s);
+    pa_signal_new(SIGUSR1, on_pause_signal, &s);
 
     int ret = 1;
     if (s.recorder->start()) {
+        enable_keys(s);
         schedule_status(s);
         pa_mainloop_run(s.ml, &ret);
     }
 
+    restore_keys(s);
     if (s.status_ev) s.api->time_free(s.status_ev);
     s.recorder.reset();
     pa_signal_done();
@@ -231,8 +306,20 @@ int bad_arg(const char* opt, const char* value) {
     return 2;
 }
 
+bool parse_seconds(const char* s, double max, double& out) {
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s || *end || !(v > 0) || v > max) return false;
+    out = v;
+    return true;
+}
+
+enum LongOnly { kOptSplit = 1000, kOptAutoStop, kOptTitle, kOptArtist };
+
 int cmd_record(int argc, char** argv) {
     static const option long_opts[] = {
+        {"split", required_argument, nullptr, kOptSplit}, {"auto-stop", required_argument, nullptr, kOptAutoStop},
+        {"title", required_argument, nullptr, kOptTitle}, {"artist", required_argument, nullptr, kOptArtist},
         {"output", required_argument, nullptr, 'o'},  {"app", required_argument, nullptr, 'a'},
         {"index", required_argument, nullptr, 'i'},   {"sink", required_argument, nullptr, 's'},
         {"duration", required_argument, nullptr, 'd'}, {"rate", required_argument, nullptr, 'r'},
@@ -280,6 +367,14 @@ int cmd_record(int argc, char** argv) {
             if (end == optarg || *end || !(opts.duration > 0)) return bad_arg("--duration", optarg);
             break;
         }
+        case kOptSplit:
+            if (!parse_seconds(optarg, 30, opts.split_silence)) return bad_arg("--split", optarg);
+            break;
+        case kOptAutoStop:
+            if (!parse_seconds(optarg, 86400, opts.stop_silence)) return bad_arg("--auto-stop", optarg);
+            break;
+        case kOptTitle: opts.tags.title = optarg; break;
+        case kOptArtist: opts.tags.artist = optarg; break;
         case 'h': print_usage(stdout); return 0;
         default: print_usage(stderr); return 2;
         }
@@ -306,18 +401,17 @@ int cmd_record(int argc, char** argv) {
         std::fprintf(stderr, "deskrec: --float doesn't apply to mp3 (use --bitrate for quality)\n");
         return 2;
     }
-    if (opts.output.empty()) {
-        std::string label = "Desktop audio";
-        if (opts.apps.size() == 1 && opts.indices.empty()) {
-            label = opts.apps[0];
-            label[0] = char(std::toupper(static_cast<unsigned char>(label[0])));
-        } else if (opts.app_mode()) {
-            label = "Apps";
-        } else if (!opts.sink.empty()) {
-            label = opts.sink;
-        }
-        opts.output = recording_path("", label, opts.format);
+    std::string label = "Desktop audio";
+    if (opts.apps.size() == 1 && opts.indices.empty()) {
+        label = opts.apps[0];
+        label[0] = char(std::toupper(static_cast<unsigned char>(label[0])));
+    } else if (opts.app_mode()) {
+        label = "Apps";
+    } else if (!opts.sink.empty()) {
+        label = opts.sink;
     }
+    if (opts.output.empty()) opts.output = recording_path("", label, opts.format);
+    if (opts.tags.artist.empty()) opts.tags.artist = label;
 
     return run_record(opts, quiet);
 }
