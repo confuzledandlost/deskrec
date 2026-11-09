@@ -46,7 +46,13 @@ listed, but "All desktop audio" still includes them.
 
 Choose the format and the folder at the bottom of the window (default: WAV in
 your Music folder); both are remembered in `~/.config/deskrec/settings.ini`.
-Closing the window while recording saves what you have so far.
+Files are named after the source and the time, e.g.
+`Firefox - 2026-11-08 23-40.flac`; a number is added if that name is taken.
+
+While recording, a level meter shows how loud the captured audio is, and
+Pause/Resume skips over parts you don't want. The result is one file with no
+gap where the pause was. Closing the window while recording saves what you have
+so far.
 
 ## Command line
 
@@ -68,7 +74,10 @@ deskrec record -F mp3 -b 320          # or pick it explicitly
 | FLAC   | `-F flac` | Lossless, compressed (16-bit, `-f` = 24-bit) | ~5 MB/min, varies with content |
 | MP3    | `-F mp3`  | Lossy; high-quality VBR by default, `-b KBPS` for constant bitrate | ~1.5 MB/min |
 
-Stop a recording with Ctrl+C. Run `deskrec --help` for all options.
+Without `-o`, the file goes in the current directory and is named after what
+you record, e.g. `Firefox - 2026-11-08 23-40.wav` or
+`Desktop audio - 2026-11-08 23-40.wav`. Stop a recording with Ctrl+C. Run
+`deskrec --help` for all options.
 
 Behaviour worth knowing:
 

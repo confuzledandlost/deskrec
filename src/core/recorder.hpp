@@ -27,6 +27,7 @@ struct RecordOptions {
 
 struct RecorderStatus {
     bool started = false;  // false while waiting for the first audio
+    bool paused = false;
     double seconds = 0;
     float peak = 0;        // linear peak since the previous status() call
     size_t streams = 0;    // capture streams currently delivering audio
@@ -53,6 +54,10 @@ public:
     // error hook has been called and `finished` won't be.
     bool start();
     void stop();
+    // While paused, incoming audio is discarded and the timeline is frozen, so
+    // the file continues seamlessly after resume().
+    void pause();
+    void resume();
     RecorderStatus status();
     const RecordOptions& options() const;
 
@@ -62,4 +67,7 @@ private:
 };
 
 std::string format_duration(double seconds);  // HH:MM:SS
-std::string default_filename(Format format);  // deskrec-YYYYMMDD-HHMMSS.<ext>
+
+// "<dir>/<label> - YYYY-MM-DD HH-MM.<ext>", with " (2)", " (3)", ... appended if
+// that file already exists. An empty dir means the current directory.
+std::string recording_path(const std::string& dir, const std::string& label, Format format);

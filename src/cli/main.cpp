@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <csignal>
@@ -25,7 +26,8 @@ Usage:
   deskrec record [options]    Record (default: everything on the default output)
 
 Record options:
-  -o, --output FILE       File to write (default: deskrec-YYYYMMDD-HHMMSS.<format>)
+  -o, --output FILE       File to write (default: "<source> - YYYY-MM-DD HH-MM.<format>"
+                          in the current directory)
   -F, --format FORMAT     wav (uncompressed), flac (lossless, ~half the size) or
                           mp3 (lossy, smallest). Default: taken from the -o
                           extension, otherwise wav
@@ -304,7 +306,18 @@ int cmd_record(int argc, char** argv) {
         std::fprintf(stderr, "deskrec: --float doesn't apply to mp3 (use --bitrate for quality)\n");
         return 2;
     }
-    if (opts.output.empty()) opts.output = default_filename(opts.format);
+    if (opts.output.empty()) {
+        std::string label = "Desktop audio";
+        if (opts.apps.size() == 1 && opts.indices.empty()) {
+            label = opts.apps[0];
+            label[0] = char(std::toupper(static_cast<unsigned char>(label[0])));
+        } else if (opts.app_mode()) {
+            label = "Apps";
+        } else if (!opts.sink.empty()) {
+            label = opts.sink;
+        }
+        opts.output = recording_path("", label, opts.format);
+    }
 
     return run_record(opts, quiet);
 }

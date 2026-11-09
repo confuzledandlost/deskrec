@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@ struct SourceEntry {
     std::string title;
     std::string subtitle;
     std::string icon;
+    std::string file_label;  // used in the recording's filename
 };
 
 // Apps stay listed after their audio stops, so you can pick one and press
@@ -42,7 +44,10 @@ struct App {
     GtkWidget* list = nullptr;
     GtkWidget* status = nullptr;
     GtkWidget* record_btn = nullptr;
+    GtkWidget* pause_btn = nullptr;
     GtkWidget* open_btn = nullptr;
+    GtkWidget* meter = nullptr;
+    double meter_level = 0;
     GtkWidget* format_dropdown = nullptr;
     GtkWidget* folder_btn = nullptr;
 
@@ -205,13 +210,13 @@ std::vector<SourceEntry> build_entries(App& app) {
     for (const auto& o : outputs)
         if (o.is_default) default_desc = o.description;
     out.push_back({SourceKind::DefaultOutput, kDefaultKey, "", "All desktop audio",
-                   "Everything playing on " + default_desc, "audio-speakers-symbolic"});
+                   "Everything playing on " + default_desc, "audio-speakers-symbolic", "Desktop audio"});
 
     if (outputs.size() > 1) {
         for (const auto& o : outputs) {
             if (o.is_default) continue;
             out.push_back({SourceKind::Output, "out:" + o.name, o.name, o.description,
-                           "Only what plays on this output", "audio-card-symbolic"});
+                           "Only what plays on this output", "audio-card-symbolic", o.description});
         }
     }
 
@@ -238,7 +243,7 @@ std::vector<SourceEntry> build_entries(App& app) {
             subtitle = "Not playing right now";
         const bool has_icon = !seen.icon.empty() && gtk_icon_theme_has_icon(theme, seen.icon.c_str());
         out.push_back({SourceKind::App, key, seen.name, seen.name, subtitle,
-                       has_icon ? seen.icon : "audio-x-generic-symbolic"});
+                       has_icon ? seen.icon : "audio-x-generic-symbolic", seen.name});
     }
     return out;
 }
@@ -306,6 +311,12 @@ void set_recording_ui(App& app, bool recording) {
     gtk_widget_set_sensitive(app.list, !recording);
     gtk_widget_set_sensitive(app.format_dropdown, !recording);
     gtk_widget_set_sensitive(app.folder_btn, !recording);
+
+    gtk_button_set_label(GTK_BUTTON(app.pause_btn), "Pause");
+    gtk_widget_set_visible(app.pause_btn, recording);
+    app.meter_level = 0;
+    gtk_level_bar_set_value(GTK_LEVEL_BAR(app.meter), 0);
+    gtk_widget_set_visible(app.meter, recording);
 }
 
 gboolean on_status_tick(gpointer ud) {
@@ -315,11 +326,31 @@ gboolean on_status_tick(gpointer ud) {
         return G_SOURCE_REMOVE;
     }
     const RecorderStatus s = app.recorder->status();
-    if (s.started)
+    if (s.paused)
+        set_status(app, "Paused   " + format_duration(s.seconds));
+    else if (s.started)
         set_status(app, "Recording " + app.recording_title + "   " + format_duration(s.seconds));
     else
         set_status(app, "Waiting for " + app.recording_title + " to play audio...");
+
+    // Map -60..0 dBFS onto the bar; let it fall back gradually like a VU meter.
+    const double db = s.peak > 0 ? 20.0 * std::log10(double(s.peak)) : -100.0;
+    const double level = s.paused ? 0.0 : std::clamp((db + 60.0) / 60.0, 0.0, 1.0);
+    app.meter_level = std::max(level, app.meter_level * 0.8);
+    gtk_level_bar_set_value(GTK_LEVEL_BAR(app.meter), app.meter_level);
     return G_SOURCE_CONTINUE;
+}
+
+void on_pause_clicked(GtkButton*, gpointer ud) {
+    auto& app = *static_cast<App*>(ud);
+    if (!app.recorder) return;
+    const bool paused = app.recorder->status().paused;
+    if (paused)
+        app.recorder->resume();
+    else
+        app.recorder->pause();
+    gtk_button_set_label(GTK_BUTTON(app.pause_btn), paused ? "Pause" : "Resume");
+    on_status_tick(&app);
 }
 
 gboolean on_finished_idle(gpointer ud) {
@@ -356,9 +387,7 @@ void start_recording(App& app) {
     if (entry->kind == SourceKind::Output) opts.sink = entry->target;
     if (entry->kind == SourceKind::App) opts.apps.push_back(entry->target);
     g_mkdir_with_parents(app.folder.c_str(), 0755);
-    char* path = g_build_filename(app.folder.c_str(), default_filename(opts.format).c_str(), nullptr);
-    opts.output = path;
-    g_free(path);
+    opts.output = recording_path(app.folder, entry->file_label, opts.format);
 
     app.last_error.clear();
     app.last_file = opts.output;
@@ -387,7 +416,7 @@ void start_recording(App& app) {
     gtk_widget_set_visible(app.open_btn, FALSE);
     set_recording_ui(app, true);
     on_status_tick(&app);
-    app.status_timer = g_timeout_add(250, on_status_tick, &app);
+    app.status_timer = g_timeout_add(100, on_status_tick, &app);
 }
 
 void on_record_clicked(GtkButton*, gpointer ud) {
@@ -506,6 +535,14 @@ void on_activate(GtkApplication* gapp, gpointer ud) {
     gtk_label_set_wrap(GTK_LABEL(app.status), TRUE);
     gtk_box_append(GTK_BOX(box), app.status);
 
+    app.meter = gtk_level_bar_new();
+    // Drop GTK's default low/high/full colour bands; a plain bar reads better as a meter.
+    gtk_level_bar_remove_offset_value(GTK_LEVEL_BAR(app.meter), GTK_LEVEL_BAR_OFFSET_LOW);
+    gtk_level_bar_remove_offset_value(GTK_LEVEL_BAR(app.meter), GTK_LEVEL_BAR_OFFSET_HIGH);
+    gtk_level_bar_remove_offset_value(GTK_LEVEL_BAR(app.meter), GTK_LEVEL_BAR_OFFSET_FULL);
+    gtk_widget_set_visible(app.meter, FALSE);
+    gtk_box_append(GTK_BOX(box), app.meter);
+
     GtkWidget* buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     app.open_btn = gtk_button_new_with_label("Show file");
     gtk_widget_set_visible(app.open_btn, FALSE);
@@ -514,7 +551,11 @@ void on_activate(GtkApplication* gapp, gpointer ud) {
     gtk_widget_add_css_class(app.record_btn, "suggested-action");
     gtk_widget_set_hexpand(app.record_btn, TRUE);
     g_signal_connect(app.record_btn, "clicked", G_CALLBACK(on_record_clicked), &app);
+    app.pause_btn = gtk_button_new_with_label("Pause");
+    gtk_widget_set_visible(app.pause_btn, FALSE);
+    g_signal_connect(app.pause_btn, "clicked", G_CALLBACK(on_pause_clicked), &app);
     gtk_box_append(GTK_BOX(buttons), app.record_btn);
+    gtk_box_append(GTK_BOX(buttons), app.pause_btn);
     gtk_box_append(GTK_BOX(buttons), app.open_btn);
     gtk_box_append(GTK_BOX(box), buttons);
 

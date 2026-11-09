@@ -14,6 +14,7 @@
 #include <ctime>
 #include <map>
 #include <memory>
+#include <unistd.h>
 
 namespace {
 
@@ -42,6 +43,8 @@ public:
 
     bool start();
     void stop(int code);
+    void pause();
+    void resume();
     RecorderStatus status();
     const RecordOptions& options() const { return opts_; }
 
@@ -100,7 +103,9 @@ private:
     Mixer mixer_;
     std::unique_ptr<AudioWriter> writer_;
 
-    pa_usec_t start_usec_ = 0;  // 0 until the first audio arrives
+    pa_usec_t start_usec_ = 0;  // 0 until the first audio arrives; shifted forward by time spent paused
+    pa_usec_t pause_usec_ = 0;
+    bool paused_ = false;
     int64_t limit_frames_ = -1;
     float peak_ = 0;
     pa_usec_t last_sync_ = 0;
@@ -122,11 +127,23 @@ std::string format_duration(double seconds) {
     return buf;
 }
 
-std::string default_filename(Format format) {
-    char buf[64];
+std::string recording_path(const std::string& dir, const std::string& label, Format format) {
+    std::string name;
+    for (unsigned char c : label) {
+        if (c == '/' || c < 0x20) name += '_';
+        else name += char(c);
+    }
+    if (name.empty() || name == "." || name == "..") name = "Recording";
+
+    char stamp[32];
     const std::time_t t = std::time(nullptr);
-    std::strftime(buf, sizeof buf, "deskrec-%Y%m%d-%H%M%S.", std::localtime(&t));
-    return std::string(buf) + format_name(format);
+    std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H-%M", std::localtime(&t));
+
+    const std::string base = (dir.empty() ? "" : dir + "/") + name + " - " + stamp;
+    const std::string ext = std::string(".") + format_name(format);
+    std::string path = base + ext;
+    for (int n = 2; access(path.c_str(), F_OK) == 0; ++n) path = base + " (" + std::to_string(n) + ")" + ext;
+    return path;
 }
 
 void Recorder::Impl::note(const char* fmt, ...) {
@@ -454,11 +471,24 @@ void Recorder::Impl::stream_read_cb(pa_stream* s, size_t, void* ud) {
 
 int64_t Recorder::Impl::now_frames() const {
     if (!start_usec_) return 0;
-    return int64_t((pa_rtclock_now() - start_usec_) * spec_.rate / PA_USEC_PER_SEC);
+    const pa_usec_t now = paused_ ? pause_usec_ : pa_rtclock_now();
+    return int64_t((now - start_usec_) * spec_.rate / PA_USEC_PER_SEC);
+}
+
+void Recorder::Impl::pause() {
+    if (!started_ || stopping_ || paused_) return;
+    paused_ = true;
+    pause_usec_ = pa_rtclock_now();
+}
+
+void Recorder::Impl::resume() {
+    if (!paused_) return;
+    paused_ = false;
+    if (start_usec_) start_usec_ += pa_rtclock_now() - pause_usec_;
 }
 
 void Recorder::Impl::on_data(Capture& c, const float* data, size_t frames, size_t queued_after) {
-    if (stopping_ || frames == 0) return;
+    if (stopping_ || paused_ || frames == 0) return;
     if (!data) {
         // A hole in the stream: keep the timeline moving, it will be silent.
         if (c.anchored) c.cursor += int64_t(frames);
@@ -538,6 +568,7 @@ void Recorder::Impl::tick() {
 RecorderStatus Recorder::Impl::status() {
     RecorderStatus s;
     s.started = start_usec_ != 0;
+    s.paused = paused_;
     s.seconds = double(now_frames()) / spec_.rate;
     if (opts_.duration > 0) s.seconds = std::min(s.seconds, opts_.duration);
     s.peak = peak_;
@@ -573,5 +604,7 @@ Recorder::~Recorder() = default;
 
 bool Recorder::start() { return impl_->start(); }
 void Recorder::stop() { impl_->stop(0); }
+void Recorder::pause() { impl_->pause(); }
+void Recorder::resume() { impl_->resume(); }
 RecorderStatus Recorder::status() { return impl_->status(); }
 const RecordOptions& Recorder::options() const { return impl_->options(); }
