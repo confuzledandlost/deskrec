@@ -86,7 +86,9 @@ void SourceWatcher::refresh() {
                 self->pending_apps_.push_back({info->index, get_prop(info->proplist, PA_PROP_APPLICATION_NAME),
                                                get_prop(info->proplist, PA_PROP_APPLICATION_PROCESS_BINARY),
                                                get_prop(info->proplist, PA_PROP_APPLICATION_ICON_NAME),
-                                               info->name ? info->name : "", info->sink, info->corked != 0});
+                                               info->name ? info->name : "",
+                                               get_prop(info->proplist, PA_PROP_MEDIA_ROLE), info->sink,
+                                               info->corked != 0});
                 return;
             }
             self->in_flight_ = false;

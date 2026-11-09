@@ -43,6 +43,13 @@ struct App {
     GtkWidget* status = nullptr;
     GtkWidget* record_btn = nullptr;
     GtkWidget* open_btn = nullptr;
+    GtkWidget* format_dropdown = nullptr;
+    GtkWidget* folder_btn = nullptr;
+
+    // Settings, persisted in ~/.config/deskrec/settings.ini.
+    Format format = Format::Wav;
+    std::string folder;
+    std::vector<Format> formats;  // dropdown index -> format
 
     pa_glib_mainloop* pa_loop = nullptr;
     std::unique_ptr<SourceWatcher> watcher;
@@ -68,15 +75,124 @@ std::string lower(std::string s) {
     return s;
 }
 
-std::string output_dir() {
+std::string default_folder() {
     const char* music = g_get_user_special_dir(G_USER_DIRECTORY_MUSIC);
-    std::string dir = music ? music : g_get_home_dir();
-    g_mkdir_with_parents(dir.c_str(), 0755);
-    return dir;
+    return music ? music : g_get_home_dir();
 }
 
 void set_status(App& app, const std::string& text) {
     gtk_label_set_text(GTK_LABEL(app.status), text.c_str());
+}
+
+// Event sounds (notification bings, volume pops) and speech-dispatcher's
+// always-silent placeholder stream aren't useful recording targets on their own;
+// "All desktop audio" still includes them.
+bool is_system_stream(const AppStreamInfo& s) {
+    return s.role == "event" || s.binary == "gnome-shell" || s.binary == "sd_dummy";
+}
+
+// ---------------------------------------------------------------- settings
+
+std::string settings_path() {
+    char* path = g_build_filename(g_get_user_config_dir(), "deskrec", "settings.ini", nullptr);
+    std::string out = path;
+    g_free(path);
+    return out;
+}
+
+void load_settings(App& app) {
+    app.format = Format::Wav;
+    app.folder = default_folder();
+
+    GKeyFile* kf = g_key_file_new();
+    if (g_key_file_load_from_file(kf, settings_path().c_str(), G_KEY_FILE_NONE, nullptr)) {
+        if (char* f = g_key_file_get_string(kf, "recording", "format", nullptr)) {
+            Format parsed;
+            if (parse_format(f, parsed) && format_available(parsed)) app.format = parsed;
+            g_free(f);
+        }
+        if (char* dir = g_key_file_get_string(kf, "recording", "folder", nullptr)) {
+            if (g_file_test(dir, G_FILE_TEST_IS_DIR)) app.folder = dir;
+            g_free(dir);
+        }
+    }
+    g_key_file_free(kf);
+}
+
+void save_settings(const App& app) {
+    GKeyFile* kf = g_key_file_new();
+    g_key_file_set_string(kf, "recording", "format", format_name(app.format));
+    g_key_file_set_string(kf, "recording", "folder", app.folder.c_str());
+
+    const std::string path = settings_path();
+    char* dir = g_path_get_dirname(path.c_str());
+    g_mkdir_with_parents(dir, 0755);
+    g_free(dir);
+    g_key_file_save_to_file(kf, path.c_str(), nullptr);
+    g_key_file_free(kf);
+}
+
+void update_folder_button(App& app) {
+    char* base = g_path_get_basename(app.folder.c_str());
+    gtk_button_set_label(GTK_BUTTON(app.folder_btn), base);
+    gtk_widget_set_tooltip_text(app.folder_btn, app.folder.c_str());
+    g_free(base);
+}
+
+void on_format_changed(GObject* dropdown, GParamSpec*, gpointer ud) {
+    auto& app = *static_cast<App*>(ud);
+    const guint idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(dropdown));
+    if (idx >= app.formats.size()) return;
+    app.format = app.formats[idx];
+    save_settings(app);
+}
+
+void set_folder(App& app, GFile* folder) {
+    if (char* path = g_file_get_path(folder)) {
+        app.folder = path;
+        g_free(path);
+        update_folder_button(app);
+        save_settings(app);
+    }
+}
+
+#if GTK_CHECK_VERSION(4, 10, 0)
+void on_folder_chosen(GObject* source, GAsyncResult* result, gpointer ud) {
+    GFile* folder = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(source), result, nullptr);
+    if (!folder) return;  // cancelled
+    set_folder(*static_cast<App*>(ud), folder);
+    g_object_unref(folder);
+}
+#else
+void on_folder_response(GtkNativeDialog* dialog, int response, gpointer ud) {
+    if (response == GTK_RESPONSE_ACCEPT) {
+        GFile* folder = gtk_file_chooser_get_file(GTK_FILE_CHOOSER(dialog));
+        if (folder) {
+            set_folder(*static_cast<App*>(ud), folder);
+            g_object_unref(folder);
+        }
+    }
+    g_object_unref(dialog);
+}
+#endif
+
+void on_folder_clicked(GtkButton*, gpointer ud) {
+    auto& app = *static_cast<App*>(ud);
+    GFile* current = g_file_new_for_path(app.folder.c_str());
+#if GTK_CHECK_VERSION(4, 10, 0)
+    GtkFileDialog* dialog = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dialog, "Save recordings to");
+    gtk_file_dialog_set_initial_folder(dialog, current);
+    gtk_file_dialog_select_folder(dialog, GTK_WINDOW(app.window), nullptr, on_folder_chosen, &app);
+    g_object_unref(dialog);
+#else
+    GtkFileChooserNative* dialog = gtk_file_chooser_native_new(
+        "Save recordings to", GTK_WINDOW(app.window), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, "_Select", "_Cancel");
+    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog), current, nullptr);
+    g_signal_connect(dialog, "response", G_CALLBACK(on_folder_response), &app);
+    gtk_native_dialog_show(GTK_NATIVE_DIALOG(dialog));
+#endif
+    g_object_unref(current);
 }
 
 // ---------------------------------------------------------------- source list
@@ -102,7 +218,7 @@ std::vector<SourceEntry> build_entries(App& app) {
     for (auto& [key, seen] : app.seen_apps) seen.playing = seen.paused = 0;
     for (const auto& s : app.watcher->apps()) {
         const std::string name = !s.app.empty() ? s.app : s.binary;
-        if (name.empty()) continue;
+        if (name.empty() || is_system_stream(s)) continue;
         SeenApp& seen = app.seen_apps["app:" + lower(name)];
         seen.name = name;
         if (!s.icon.empty()) seen.icon = s.icon;
@@ -188,6 +304,8 @@ void set_recording_ui(App& app, bool recording) {
         gtk_widget_add_css_class(app.record_btn, "suggested-action");
     }
     gtk_widget_set_sensitive(app.list, !recording);
+    gtk_widget_set_sensitive(app.format_dropdown, !recording);
+    gtk_widget_set_sensitive(app.folder_btn, !recording);
 }
 
 gboolean on_status_tick(gpointer ud) {
@@ -234,9 +352,11 @@ void start_recording(App& app) {
     if (!entry) return;
 
     RecordOptions opts;
+    opts.format = app.format;
     if (entry->kind == SourceKind::Output) opts.sink = entry->target;
     if (entry->kind == SourceKind::App) opts.apps.push_back(entry->target);
-    char* path = g_build_filename(output_dir().c_str(), default_filename(opts.format).c_str(), nullptr);
+    g_mkdir_with_parents(app.folder.c_str(), 0755);
+    char* path = g_build_filename(app.folder.c_str(), default_filename(opts.format).c_str(), nullptr);
     opts.output = path;
     g_free(path);
 
@@ -316,6 +436,8 @@ void on_activate(GtkApplication* gapp, gpointer ud) {
         return;
     }
 
+    load_settings(app);
+
     app.window = gtk_application_window_new(gapp);
     gtk_window_set_title(GTK_WINDOW(app.window), "deskrec");
     gtk_window_set_default_size(GTK_WINDOW(app.window), 420, 480);
@@ -344,6 +466,41 @@ void on_activate(GtkApplication* gapp, gpointer ud) {
     gtk_frame_set_child(GTK_FRAME(frame), scroller);
     gtk_box_append(GTK_BOX(box), frame);
 
+    GtkWidget* settings = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget* format_label = gtk_label_new("Format");
+    gtk_widget_add_css_class(format_label, "dim-label");
+    gtk_box_append(GTK_BOX(settings), format_label);
+
+    std::vector<std::string> names;
+    for (Format f : {Format::Wav, Format::Flac, Format::Mp3}) {
+        if (!format_available(f)) continue;
+        app.formats.push_back(f);
+        names.push_back(f == Format::Wav    ? "WAV (uncompressed)"
+                        : f == Format::Flac ? "FLAC (lossless, smaller)"
+                                            : "MP3 (smallest)");
+    }
+    std::vector<const char*> c_names;
+    for (const auto& n : names) c_names.push_back(n.c_str());
+    c_names.push_back(nullptr);
+    app.format_dropdown = gtk_drop_down_new_from_strings(c_names.data());
+    const auto current = std::find(app.formats.begin(), app.formats.end(), app.format);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(app.format_dropdown), guint(current - app.formats.begin()));
+    g_signal_connect(app.format_dropdown, "notify::selected", G_CALLBACK(on_format_changed), &app);
+    gtk_box_append(GTK_BOX(settings), app.format_dropdown);
+
+    GtkWidget* spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_append(GTK_BOX(settings), spacer);
+
+    GtkWidget* folder_label = gtk_label_new("Save to");
+    gtk_widget_add_css_class(folder_label, "dim-label");
+    gtk_box_append(GTK_BOX(settings), folder_label);
+    app.folder_btn = gtk_button_new();
+    update_folder_button(app);
+    g_signal_connect(app.folder_btn, "clicked", G_CALLBACK(on_folder_clicked), &app);
+    gtk_box_append(GTK_BOX(settings), app.folder_btn);
+    gtk_box_append(GTK_BOX(box), settings);
+
     app.status = gtk_label_new(nullptr);
     gtk_label_set_xalign(GTK_LABEL(app.status), 0);
     gtk_label_set_wrap(GTK_LABEL(app.status), TRUE);
@@ -361,7 +518,7 @@ void on_activate(GtkApplication* gapp, gpointer ud) {
     gtk_box_append(GTK_BOX(buttons), app.open_btn);
     gtk_box_append(GTK_BOX(box), buttons);
 
-    set_status(app, "Recordings are saved to " + output_dir());
+    set_status(app, "Pick what to record and press Record.");
 
     SourceWatcher::Hooks hooks;
     hooks.changed = [&app] { rebuild_list(app); };

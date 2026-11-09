@@ -20,6 +20,7 @@ struct AppStreamInfo {
     std::string binary;
     std::string icon;
     std::string media;
+    std::string role;  // media.role, e.g. "music", "video", "event"
     uint32_t sink;
     bool corked;
 };

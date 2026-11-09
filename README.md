@@ -40,8 +40,13 @@ distro release.
 Run `deskrec-gui` or open "deskrec" from your app launcher. Pick what to record
 (all desktop audio, a specific output, or an app) and press Record. The app list
 updates live, and apps stay listed after they go quiet, so you can select one
-and press Record before it starts playing. Recordings are saved as WAV in your
-Music folder; closing the window while recording saves what you have so far.
+and press Record before it starts playing. System sounds (notification and
+volume-change sounds, speech-dispatcher's silent placeholder stream) aren't
+listed, but "All desktop audio" still includes them.
+
+Choose the format and the folder at the bottom of the window (default: WAV in
+your Music folder); both are remembered in `~/.config/deskrec/settings.ini`.
+Closing the window while recording saves what you have so far.
 
 ## Command line
 
