@@ -1,26 +1,24 @@
 #include "recorder.hpp"
 
+#include "audio_writer.hpp"
 #include "mixer.hpp"
 #include "pulse_common.hpp"
-#include "audio_writer.hpp"
 
 #include <pulse/pulseaudio.h>
 
 #include <algorithm>
 #include <cmath>
-#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <map>
 #include <memory>
-#include <unistd.h>
 
 namespace {
 
 constexpr pa_usec_t kTickUsec = 100 * 1000;
 constexpr pa_usec_t kFragmentUsec = 20 * 1000;
-constexpr pa_usec_t kStatusUsec = 250 * 1000;
 constexpr pa_usec_t kSyncUsec = 1000 * 1000;
 constexpr pa_usec_t kRetryUsec = 1000 * 1000;
 // Audio is held this long before being written so every stream's data for a
@@ -34,32 +32,38 @@ constexpr double kResyncSec = 1.5;
 
 constexpr uint32_t kSystemKey = PA_INVALID_INDEX;
 
-class Recorder;
+}  // namespace
 
-struct Capture {
-    Recorder* owner = nullptr;
-    uint32_t key = kSystemKey;  // sink input index, or kSystemKey for a whole output
-    uint32_t sink = PA_INVALID_INDEX;
-    std::string label;
-    pa_stream* stream = nullptr;
-    bool dead = false;
-    bool announced = false;
-    bool anchored = false;
-    int64_t cursor = 0;
-};
-
-struct SinkLookup {
-    Recorder* owner;
-    uint32_t key;
-    uint32_t sink;
-};
-
-class Recorder {
+class Recorder::Impl {
 public:
-    explicit Recorder(const RecordOptions& opts) : opts_(opts), mixer_(opts.channels) {}
-    int run();
+    Impl(pa_mainloop_api* api, RecordOptions opts, Hooks hooks)
+        : opts_(std::move(opts)), hooks_(std::move(hooks)), api_(api), mixer_(opts_.channels) {}
+    ~Impl();
+
+    bool start();
+    void stop(int code);
+    RecorderStatus status();
+    const RecordOptions& options() const { return opts_; }
 
 private:
+    struct Capture {
+        Impl* owner = nullptr;
+        uint32_t key = kSystemKey;  // sink input index, or kSystemKey for a whole output
+        uint32_t sink = PA_INVALID_INDEX;
+        std::string label;
+        pa_stream* stream = nullptr;
+        bool dead = false;
+        bool announced = false;
+        bool anchored = false;
+        int64_t cursor = 0;
+    };
+
+    struct SinkLookup {
+        Impl* owner;
+        uint32_t key;
+        uint32_t sink;
+    };
+
     static void context_state_cb(pa_context* c, void* ud);
     static void subscribe_cb(pa_context* c, pa_subscription_event_type_t t, uint32_t idx, void* ud);
     static void server_info_cb(pa_context* c, const pa_server_info* info, void* ud);
@@ -69,7 +73,6 @@ private:
     static void stream_state_cb(pa_stream* s, void* ud);
     static void stream_read_cb(pa_stream* s, size_t nbytes, void* ud);
     static void tick_cb(pa_mainloop_api* api, pa_time_event* e, const struct timeval* tv, void* ud);
-    static void signal_cb(pa_mainloop_api* api, pa_signal_event* e, int sig, void* ud);
 
     void on_ready();
     void refresh_system_sink();
@@ -82,15 +85,12 @@ private:
     int64_t now_frames() const;
     void flush_to(int64_t upto);
     void tick();
-    void stop(int code);
-    void print_status();
     void note(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
     void error(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
-    void vlog(const char* fmt, va_list ap);
 
     RecordOptions opts_;
-    pa_mainloop* ml_ = nullptr;
-    pa_mainloop_api* api_ = nullptr;
+    Hooks hooks_;
+    pa_mainloop_api* api_;
     pa_context* ctx_ = nullptr;
     pa_time_event* tick_ev_ = nullptr;
     pa_sample_spec spec_{};
@@ -103,64 +103,66 @@ private:
     pa_usec_t start_usec_ = 0;  // 0 until the first audio arrives
     int64_t limit_frames_ = -1;
     float peak_ = 0;
-    pa_usec_t last_status_ = 0;
     pa_usec_t last_sync_ = 0;
     pa_usec_t last_retry_ = 0;
     bool need_rescan_ = false;
     bool lookup_pending_ = false;
     bool waiting_shown_ = false;
+    bool started_ = false;
     bool stopping_ = false;
     bool write_failed_ = false;
-    bool status_tty_ = false;
-    bool status_dirty_ = false;
 };
 
-// ---------------------------------------------------------------- logging
+// ---------------------------------------------------------------- helpers
 
-void Recorder::vlog(const char* fmt, va_list ap) {
-    if (status_dirty_) {
-        std::fputs("\r\033[K", stderr);
-        status_dirty_ = false;
-    }
-    std::vfprintf(stderr, fmt, ap);
-    std::fputc('\n', stderr);
-}
-
-void Recorder::note(const char* fmt, ...) {
-    if (opts_.quiet) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vlog(fmt, ap);
-    va_end(ap);
-}
-
-void Recorder::error(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vlog(fmt, ap);
-    va_end(ap);
-}
-
-std::string format_time(double seconds) {
+std::string format_duration(double seconds) {
     const long total = long(seconds);
     char buf[32];
     std::snprintf(buf, sizeof buf, "%02ld:%02ld:%02ld", total / 3600, (total / 60) % 60, total % 60);
     return buf;
 }
 
+std::string default_filename(Format format) {
+    char buf[64];
+    const std::time_t t = std::time(nullptr);
+    std::strftime(buf, sizeof buf, "deskrec-%Y%m%d-%H%M%S.", std::localtime(&t));
+    return std::string(buf) + format_name(format);
+}
+
+void Recorder::Impl::note(const char* fmt, ...) {
+    if (!hooks_.note) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    hooks_.note(buf);
+}
+
+void Recorder::Impl::error(const char* fmt, ...) {
+    if (!hooks_.error) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    hooks_.error(buf);
+}
+
 // ---------------------------------------------------------------- setup
 
-int Recorder::run() {
+bool Recorder::Impl::start() {
+    if (started_) return true;
+
     spec_.format = PA_SAMPLE_FLOAT32NE;
     spec_.rate = opts_.rate;
     spec_.channels = opts_.channels;
     if (!pa_sample_spec_valid(&spec_)) {
         error("Invalid sample rate or channel count.");
-        return 1;
+        return false;
     }
     pa_channel_map_init_extend(&map_, spec_.channels, PA_CHANNEL_MAP_DEFAULT);
     if (opts_.duration > 0) limit_frames_ = std::llround(opts_.duration * opts_.rate);
-    status_tty_ = !opts_.quiet && isatty(STDERR_FILENO);
 
     EncoderOptions enc;
     enc.format = opts_.format;
@@ -172,20 +174,14 @@ int Recorder::run() {
     writer_ = make_writer(enc, &why);
     if (!writer_) {
         error("%s", why.c_str());
-        return 1;
+        return false;
     }
     if (!writer_->open(opts_.output)) {
         error("Cannot create %s: %s", opts_.output.c_str(), writer_->error().c_str());
         writer_.reset();
         std::remove(opts_.output.c_str());
-        return 1;
+        return false;
     }
-
-    ml_ = pa_mainloop_new();
-    api_ = pa_mainloop_get_api(ml_);
-    pa_signal_init(api_);
-    pa_signal_new(SIGINT, signal_cb, this);
-    pa_signal_new(SIGTERM, signal_cb, this);
 
     pa_proplist* props = pa_proplist_new();
     pa_proplist_sets(props, PA_PROP_APPLICATION_ID, "deskrec");
@@ -194,24 +190,33 @@ int Recorder::run() {
     pa_proplist_free(props);
     pa_context_set_state_callback(ctx_, context_state_cb, this);
 
-    int ret = 1;
     if (pa_context_connect(ctx_, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
         error("Could not connect to the sound server: %s", pa_strerror(pa_context_errno(ctx_)));
         writer_->close();
+        writer_.reset();
         std::remove(opts_.output.c_str());
-    } else {
-        pa_mainloop_run(ml_, &ret);
+        return false;
     }
-
-    if (tick_ev_) api_->time_free(tick_ev_);
-    pa_context_unref(ctx_);
-    pa_signal_done();
-    pa_mainloop_free(ml_);
-    return ret;
+    started_ = true;
+    return true;
 }
 
-void Recorder::context_state_cb(pa_context* c, void* ud) {
-    auto* self = static_cast<Recorder*>(ud);
+Recorder::Impl::~Impl() {
+    if (started_ && !stopping_) {
+        hooks_ = {};
+        stop(0);
+    }
+    if (tick_ev_) api_->time_free(tick_ev_);
+    if (ctx_) {
+        pa_context_set_state_callback(ctx_, nullptr, nullptr);
+        pa_context_set_subscribe_callback(ctx_, nullptr, nullptr);
+        pa_context_disconnect(ctx_);
+        pa_context_unref(ctx_);
+    }
+}
+
+void Recorder::Impl::context_state_cb(pa_context* c, void* ud) {
+    auto* self = static_cast<Impl*>(ud);
     switch (pa_context_get_state(c)) {
     case PA_CONTEXT_READY:
         self->on_ready();
@@ -225,7 +230,7 @@ void Recorder::context_state_cb(pa_context* c, void* ud) {
     }
 }
 
-void Recorder::on_ready() {
+void Recorder::Impl::on_ready() {
     pa_context_set_subscribe_callback(ctx_, subscribe_cb, this);
     const auto mask = opts_.app_mode() ? PA_SUBSCRIPTION_MASK_SINK_INPUT : PA_SUBSCRIPTION_MASK_SERVER;
     pa_operation_unref(pa_context_subscribe(ctx_, mask, nullptr, nullptr));
@@ -240,7 +245,7 @@ void Recorder::on_ready() {
 
 // ---------------------------------------------------------------- whole-output mode
 
-void Recorder::refresh_system_sink() {
+void Recorder::Impl::refresh_system_sink() {
     if (lookup_pending_) return;
     lookup_pending_ = true;
     if (!opts_.sink.empty())
@@ -249,8 +254,8 @@ void Recorder::refresh_system_sink() {
         pa_operation_unref(pa_context_get_server_info(ctx_, server_info_cb, this));
 }
 
-void Recorder::server_info_cb(pa_context* c, const pa_server_info* info, void* ud) {
-    auto* self = static_cast<Recorder*>(ud);
+void Recorder::Impl::server_info_cb(pa_context* c, const pa_server_info* info, void* ud) {
+    auto* self = static_cast<Impl*>(ud);
     if (!info || !info->default_sink_name) {
         self->lookup_pending_ = false;
         return;
@@ -258,13 +263,12 @@ void Recorder::server_info_cb(pa_context* c, const pa_server_info* info, void* u
     pa_operation_unref(pa_context_get_sink_info_by_name(c, info->default_sink_name, system_sink_cb, self));
 }
 
-void Recorder::system_sink_cb(pa_context*, const pa_sink_info* info, int eol, void* ud) {
-    auto* self = static_cast<Recorder*>(ud);
+void Recorder::Impl::system_sink_cb(pa_context*, const pa_sink_info* info, int eol, void* ud) {
+    auto* self = static_cast<Impl*>(ud);
     if (eol != 0) {
         self->lookup_pending_ = false;
         if (eol < 0 && !self->opts_.sink.empty() && self->captures_.empty() && !self->start_usec_) {
-            self->error("No output named '%s'. Run 'deskrec list' to see available outputs.",
-                        self->opts_.sink.c_str());
+            self->error("No output named '%s'.", self->opts_.sink.c_str());
             self->stop(1);
         }
         return;
@@ -288,12 +292,12 @@ void Recorder::system_sink_cb(pa_context*, const pa_sink_info* info, int eol, vo
 
 // ---------------------------------------------------------------- per-app mode
 
-void Recorder::rescan_sink_inputs() {
+void Recorder::Impl::rescan_sink_inputs() {
     need_rescan_ = false;
     pa_operation_unref(pa_context_get_sink_input_info_list(ctx_, sink_input_cb, this));
 }
 
-bool Recorder::matches(const pa_sink_input_info* info) const {
+bool Recorder::Impl::matches(const pa_sink_input_info* info) const {
     if (std::find(opts_.indices.begin(), opts_.indices.end(), info->index) != opts_.indices.end())
         return true;
     const std::string app = get_prop(info->proplist, PA_PROP_APPLICATION_NAME);
@@ -303,19 +307,19 @@ bool Recorder::matches(const pa_sink_input_info* info) const {
     return false;
 }
 
-void Recorder::sink_input_cb(pa_context*, const pa_sink_input_info* info, int eol, void* ud) {
-    auto* self = static_cast<Recorder*>(ud);
+void Recorder::Impl::sink_input_cb(pa_context*, const pa_sink_input_info* info, int eol, void* ud) {
+    auto* self = static_cast<Impl*>(ud);
     if (eol != 0) {
         if (eol > 0 && self->captures_.empty() && !self->waiting_shown_) {
             self->waiting_shown_ = true;
-            self->note("Waiting for a matching app to play audio... (Ctrl+C to stop)");
+            self->note("Waiting for a matching app to play audio...");
         }
         return;
     }
     if (!self->stopping_) self->consider_sink_input(info);
 }
 
-void Recorder::consider_sink_input(const pa_sink_input_info* info) {
+void Recorder::Impl::consider_sink_input(const pa_sink_input_info* info) {
     auto it = captures_.find(info->index);
     if (!matches(info)) {
         if (it != captures_.end()) close_capture(info->index, true);
@@ -342,9 +346,9 @@ void Recorder::consider_sink_input(const pa_sink_input_info* info) {
     pa_operation_unref(pa_context_get_sink_info_by_index(ctx_, info->sink, app_sink_cb, lookup));
 }
 
-void Recorder::app_sink_cb(pa_context*, const pa_sink_info* info, int eol, void* ud) {
+void Recorder::Impl::app_sink_cb(pa_context*, const pa_sink_info* info, int eol, void* ud) {
     auto* lookup = static_cast<SinkLookup*>(ud);
-    Recorder* self = lookup->owner;
+    Impl* self = lookup->owner;
     auto it = self->captures_.find(lookup->key);
     const bool wanted = it != self->captures_.end() && !it->second->stream && !it->second->dead &&
                         it->second->sink == lookup->sink;
@@ -361,8 +365,8 @@ void Recorder::app_sink_cb(pa_context*, const pa_sink_info* info, int eol, void*
     }
 }
 
-void Recorder::subscribe_cb(pa_context* c, pa_subscription_event_type_t t, uint32_t idx, void* ud) {
-    auto* self = static_cast<Recorder*>(ud);
+void Recorder::Impl::subscribe_cb(pa_context* c, pa_subscription_event_type_t t, uint32_t idx, void* ud) {
+    auto* self = static_cast<Impl*>(ud);
     if (self->stopping_) return;
     const auto facility = t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
     const auto type = t & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
@@ -379,7 +383,7 @@ void Recorder::subscribe_cb(pa_context* c, pa_subscription_event_type_t t, uint3
 
 // ---------------------------------------------------------------- streams
 
-void Recorder::open_stream(Capture& c, const char* monitor_source) {
+void Recorder::Impl::open_stream(Capture& c, const char* monitor_source) {
     const std::string name = "deskrec: " + c.label;
     pa_stream* s = pa_stream_new(ctx_, name.c_str(), &spec_, &map_);
     if (!s) {
@@ -408,7 +412,7 @@ void Recorder::open_stream(Capture& c, const char* monitor_source) {
     }
 }
 
-void Recorder::close_capture(uint32_t key, bool announce) {
+void Recorder::Impl::close_capture(uint32_t key, bool announce) {
     auto it = captures_.find(key);
     if (it == captures_.end()) return;
     Capture& c = *it->second;
@@ -423,7 +427,7 @@ void Recorder::close_capture(uint32_t key, bool announce) {
     captures_.erase(it);
 }
 
-void Recorder::stream_state_cb(pa_stream* s, void* ud) {
+void Recorder::Impl::stream_state_cb(pa_stream* s, void* ud) {
     auto* c = static_cast<Capture*>(ud);
     const auto state = pa_stream_get_state(s);
     if (state == PA_STREAM_FAILED || state == PA_STREAM_TERMINATED) {
@@ -432,7 +436,7 @@ void Recorder::stream_state_cb(pa_stream* s, void* ud) {
     }
 }
 
-void Recorder::stream_read_cb(pa_stream* s, size_t, void* ud) {
+void Recorder::Impl::stream_read_cb(pa_stream* s, size_t, void* ud) {
     auto* c = static_cast<Capture*>(ud);
     const size_t frame_bytes = pa_frame_size(&c->owner->spec_);
     // Data can arrive in bursts; what's still queued behind a chunk tells us how
@@ -448,12 +452,12 @@ void Recorder::stream_read_cb(pa_stream* s, size_t, void* ud) {
     }
 }
 
-int64_t Recorder::now_frames() const {
+int64_t Recorder::Impl::now_frames() const {
     if (!start_usec_) return 0;
     return int64_t((pa_rtclock_now() - start_usec_) * spec_.rate / PA_USEC_PER_SEC);
 }
 
-void Recorder::on_data(Capture& c, const float* data, size_t frames, size_t queued_after) {
+void Recorder::Impl::on_data(Capture& c, const float* data, size_t frames, size_t queued_after) {
     if (stopping_ || frames == 0) return;
     if (!data) {
         // A hole in the stream: keep the timeline moving, it will be silent.
@@ -477,7 +481,7 @@ void Recorder::on_data(Capture& c, const float* data, size_t frames, size_t queu
 
 // ---------------------------------------------------------------- main loop
 
-void Recorder::flush_to(int64_t upto) {
+void Recorder::Impl::flush_to(int64_t upto) {
     if (limit_frames_ >= 0) upto = std::min(upto, limit_frames_);
     mixer_.flush(upto, [this](const float* samples, size_t frames) {
         if (!write_failed_ && !writer_->write(samples, frames)) {
@@ -487,11 +491,11 @@ void Recorder::flush_to(int64_t upto) {
     });
 }
 
-void Recorder::tick_cb(pa_mainloop_api*, pa_time_event*, const struct timeval*, void* ud) {
-    static_cast<Recorder*>(ud)->tick();
+void Recorder::Impl::tick_cb(pa_mainloop_api*, pa_time_event*, const struct timeval*, void* ud) {
+    static_cast<Impl*>(ud)->tick();
 }
 
-void Recorder::tick() {
+void Recorder::Impl::tick() {
     if (stopping_) return;
     const pa_usec_t now = pa_rtclock_now();
 
@@ -527,43 +531,24 @@ void Recorder::tick() {
         last_sync_ = now;
         writer_->sync();
     }
-    if (status_tty_ && now - last_status_ >= kStatusUsec) {
-        last_status_ = now;
-        print_status();
-    }
 
     pa_context_rttime_restart(ctx_, tick_ev_, now + kTickUsec);
 }
 
-void Recorder::print_status() {
-    constexpr int kWidth = 24;
-    const float db = peak_ > 0 ? 20.0f * std::log10(peak_) : -100.0f;
+RecorderStatus Recorder::Impl::status() {
+    RecorderStatus s;
+    s.started = start_usec_ != 0;
+    s.seconds = double(now_frames()) / spec_.rate;
+    if (opts_.duration > 0) s.seconds = std::min(s.seconds, opts_.duration);
+    s.peak = peak_;
     peak_ = 0;
-    const int bars = std::clamp(int((db + 60.0f) / 60.0f * kWidth + 0.5f), 0, kWidth);
-    const std::string meter = std::string(size_t(bars), '#') + std::string(size_t(kWidth - bars), '.');
-
-    size_t live = 0;
     for (const auto& [key, cap] : captures_)
-        if (cap->stream && !cap->dead) ++live;
-
-    if (!start_usec_) {
-        std::fprintf(stderr, "\r\033[K  waiting for audio...  [%zu stream%s]", live, live == 1 ? "" : "s");
-    } else {
-        double secs = double(now_frames()) / spec_.rate;
-        if (opts_.duration > 0) secs = std::min(secs, opts_.duration);
-        std::fprintf(stderr, "\r\033[K  REC %s  [%s] %5.1f dB  [%zu stream%s]", format_time(secs).c_str(),
-                     meter.c_str(), double(std::max(db, -99.9f)), live, live == 1 ? "" : "s");
-    }
-    std::fflush(stderr);
-    status_dirty_ = true;
+        if (cap->stream && !cap->dead) ++s.streams;
+    return s;
 }
 
-void Recorder::signal_cb(pa_mainloop_api*, pa_signal_event*, int, void* ud) {
-    static_cast<Recorder*>(ud)->stop(0);
-}
-
-void Recorder::stop(int code) {
-    if (stopping_) return;
+void Recorder::Impl::stop(int code) {
+    if (!started_ || stopping_) return;
     stopping_ = true;
     if (start_usec_) flush_to(std::max(now_frames(), mixer_.buffered_end()));
     if (write_failed_) code = 1;
@@ -572,20 +557,21 @@ void Recorder::stop(int code) {
 
     const uint64_t frames = writer_->frames_written();
     writer_->close();
-    if (frames == 0) {
-        std::remove(opts_.output.c_str());
-        note("No audio was captured; nothing saved.");
-    } else {
-        note("Saved %s of audio to %s", format_time(double(frames) / spec_.rate).c_str(), opts_.output.c_str());
-    }
+    if (frames == 0) std::remove(opts_.output.c_str());
 
+    pa_context_set_state_callback(ctx_, nullptr, nullptr);
     pa_context_disconnect(ctx_);
-    pa_mainloop_quit(ml_, code);
+    if (hooks_.finished) hooks_.finished(code, frames);
 }
 
-}  // namespace
+// ---------------------------------------------------------------- public API
 
-int run_recorder(const RecordOptions& opts) {
-    Recorder recorder(opts);
-    return recorder.run();
-}
+Recorder::Recorder(pa_mainloop_api* api, RecordOptions opts, Hooks hooks)
+    : impl_(std::make_unique<Impl>(api, std::move(opts), std::move(hooks))) {}
+
+Recorder::~Recorder() = default;
+
+bool Recorder::start() { return impl_->start(); }
+void Recorder::stop() { impl_->stop(0); }
+RecorderStatus Recorder::status() { return impl_->status(); }
+const RecordOptions& Recorder::options() const { return impl_->options(); }

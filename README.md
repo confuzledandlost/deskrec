@@ -1,13 +1,14 @@
 # deskrec
 
-A small command-line recorder for Linux desktop audio. It can record everything
-your computer is playing, or just one application (for example a web browser),
-and saves it as WAV, FLAC or MP3.
+A small recorder for Linux desktop audio. It can record everything your
+computer is playing, or just one application (for example a web browser), and
+saves it as WAV, FLAC or MP3. It comes as a command-line tool (`deskrec`) and a
+simple GTK 4 window (`deskrec-gui`).
 
 It is written in C++17 on top of `libpulse`, so it works on any desktop running
 PulseAudio or PipeWire (through `pipewire-pulse`, the default on Ubuntu, Fedora,
-Debian, Arch, etc.). FLAC and MP3 use `libFLAC` and LAME; both are optional at
-build time, and without them deskrec still builds with WAV output.
+Debian, Arch, etc.). FLAC, MP3 and the GUI are optional at build time: if their
+libraries aren't installed, the rest still builds.
 
 ## Build
 
@@ -15,25 +16,34 @@ Install a compiler, CMake and the development headers:
 
 | Distro          | Command                                                                     |
 | --------------- | --------------------------------------------------------------------------- |
-| Debian / Ubuntu | `sudo apt install g++ cmake pkg-config libpulse-dev libflac-dev libmp3lame-dev` |
-| Fedora          | `sudo dnf install gcc-c++ cmake pulseaudio-libs-devel flac-devel lame-devel` |
-| Arch            | `sudo pacman -S gcc cmake pkgconf libpulse flac lame`                       |
+| Debian / Ubuntu | `sudo apt install g++ cmake pkg-config libpulse-dev libflac-dev libmp3lame-dev libgtk-4-dev` |
+| Fedora          | `sudo dnf install gcc-c++ cmake pulseaudio-libs-devel flac-devel lame-devel gtk4-devel` |
+| Arch            | `sudo pacman -S gcc cmake pkgconf libpulse flac lame gtk4`                  |
 
 Then:
 
 ```sh
 cmake -S . -B build
 cmake --build build
-sudo cmake --install build      # optional: installs to /usr/local/bin
+sudo cmake --install build      # optional: installs to /usr/local
 ```
 
-CMake prints the formats it found (`deskrec output formats: wav flac mp3`), and
-`deskrec --help` shows them too. At runtime the binary needs `libpulse`,
-`libFLAC` and `libmp3lame`, which almost every desktop already has, so a build
-from one machine also runs on other machines with the same or a newer distro
-release.
+CMake prints what it found (`deskrec output formats: wav flac mp3`,
+`deskrec GUI: enabled`). Installing puts both programs on your PATH and adds
+deskrec to your desktop's app launcher. At runtime they need `libpulse`,
+`libFLAC`, `libmp3lame` and GTK 4, which almost every desktop already has, so a
+build from one machine also runs on other machines with the same or a newer
+distro release.
 
-## Usage
+## GUI
+
+Run `deskrec-gui` or open "deskrec" from your app launcher. Pick what to record
+(all desktop audio, a specific output, or an app) and press Record. The app list
+updates live, and apps stay listed after they go quiet, so you can select one
+and press Record before it starts playing. Recordings are saved as WAV in your
+Music folder; closing the window while recording saves what you have so far.
+
+## Command line
 
 ```sh
 deskrec list                          # outputs and apps currently playing audio
@@ -70,3 +80,11 @@ Behaviour worth knowing:
   process gets killed (FLAC and MP3 players may show a wrong duration then).
 - WAV files are limited to 4 GB, about 6 hours at 48 kHz stereo 16-bit.
   FLAC and MP3 have no practical limit.
+
+## Code layout
+
+- `src/core/` – the recording engine (`Recorder`), the live source list
+  (`SourceWatcher`), the stream mixer and the WAV/FLAC/MP3 writers. It runs on
+  any PulseAudio main loop and reports through callbacks.
+- `src/cli/` – `deskrec`, on PulseAudio's own main loop.
+- `src/gui/` – `deskrec-gui`, on GLib's main loop (single-threaded, no locking).

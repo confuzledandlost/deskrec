@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=deskrec
+GenericName=Desktop Audio Recorder
+Comment=Record what your computer plays, or just one app
+Exec=deskrec-gui
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;Recorder;
+Keywords=record;audio;sound;capture;
